@@ -28,7 +28,21 @@ streamlit run app.py
 
 ## Screenshots
 
-_Add screenshots here later._
+## Screenshots
+
+### Home
+![Home](Screenshot/Home.png)
+
+### Workout Plans
+![Workout 1](Screenshot/workout.png)
+![Workout 2](Screenshot/workout_1.png)
+
+### Activities
+![Activities](Screenshot/acitivity.png)
+
+### Chat Assistant
+![Chat 1](Screenshot/chatbot.png)
+![Chat 2](Screenshot/chatbot_1.png)
 
 ## Future Improvements (V2)
 
