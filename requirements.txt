@@ -4,3 +4,4 @@ python-dotenv
 supabase
 numpy
 pandas
+langgraph

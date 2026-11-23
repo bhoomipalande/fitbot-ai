@@ -9,6 +9,7 @@ from supabase import create_client, Client
 
 from gym_data import GYM_DATA
 from rag_engine import DEFAULT_KNOWLEDGE_DOCS, embed_texts, retrieve_relevant_context
+from agent_graph import build_fitbot_graph
 from styles import load_css
 from ui import show_header, show_categories
 
@@ -296,7 +297,6 @@ def call_gemini(prompt: str, use_tools: bool = False) -> str:
 # =========================================================
 # AGENTIC WORKFLOW — RAG RETRIEVAL + TOOL ROUTING
 # =========================================================
-
 def generate_fitbot_response() -> tuple[str, dict]:
     active_gym = st.session_state["active_gym"]
     st.session_state["last_tool_used"] = None
@@ -310,54 +310,34 @@ def generate_fitbot_response() -> tuple[str, dict]:
         if message["role"] == "user":
             latest_user_query = message["content"]
 
-    retrieved_chunks = []
-    if api_key and st.session_state["rag_embeddings"]:
-        retrieved_chunks = retrieve_relevant_context(
-            client=client,
-            query=latest_user_query,
-            docs=st.session_state["rag_docs"],
-            doc_embeddings=st.session_state["rag_embeddings"],
-            top_k=3,
-        )
-
-    rag_context_str = "\n".join(
-        [f"- [{c['title']} | Relevance: {c['score']}]: {c['content']}" for c in retrieved_chunks]
+    graph = build_fitbot_graph(
+        client=client,
+        models=MODELS,
+        calc_macros_fn=calculate_macros,
+        book_trainer_fn=book_trainer_session,
     )
 
-    prompt = f"""
-You are FitBot AI, the virtual concierge and member support assistant for {active_gym['name']} in {active_gym['city']}.
-
-ACTIVE BRANCH PROFILE:
-- Club Name: {active_gym['name']}
-- City: {active_gym['city']}
-- Hours: {active_gym['timings']}
-- Standard Membership: {active_gym['monthly_fee']}
-
-RETRIEVED CLUB POLICIES & GUIDELINES:
-{rag_context_str}
-
-TRAINERS & GROUP SESSIONS:
-{GYM_DATA}
-
-CONVERSATION HISTORY:
-{conversation_history}
-
-INSTRUCTIONS:
-1. Ground all policy, freeze, refund, guest pass, pricing tier, and facility answers strictly in the RETRIEVED CLUB POLICIES & GUIDELINES above.
-2. If the member asks for daily calorie or macro targets based on weight, call `calculate_macros`.
-3. If the member asks to book a personal training session, call `book_trainer_session` immediately.
-4. Keep responses warm, professional, accurate, and concise.
-"""
-
-    reply = call_gemini(prompt, use_tools=True)
+    final_state = graph.invoke({
+        "query": latest_user_query,
+        "conversation_history": conversation_history,
+        "active_gym": active_gym,
+        "gym_data": GYM_DATA,
+        "rag_docs": st.session_state["rag_docs"],
+        "rag_embeddings": st.session_state["rag_embeddings"],
+        "retrieved_chunks": [],
+        "tool_decision": {},
+        "tool_output": "",
+        "final_response": "",
+        "nodes_visited": [],
+    })
 
     trace = {
-        "rag_sources": retrieved_chunks,
+        "nodes_visited": final_state.get("nodes_visited", []),
+        "rag_sources": final_state.get("retrieved_chunks", []),
         "tool_called": st.session_state.get("last_tool_used"),
         "gym": active_gym["name"],
     }
-    return reply, trace
-
+    return final_state["final_response"], trace
 
 # =========================================================
 # CHAT SCREEN
@@ -397,6 +377,8 @@ if st.session_state["chat_open"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("trace"):
+                if trace.get("nodes_visited"):
+                 st.caption(f"🕸️ **LangGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
                 with st.expander("Sources & Actions"):
                     trace = message["trace"]
                     if trace.get("tool_called"):
@@ -410,6 +392,7 @@ if st.session_state["chat_open"]:
             with st.spinner("Checking club policies & availability..."):
                 assistant_reply, trace = generate_fitbot_response()
             st.markdown(assistant_reply)
+            st.caption(f"🕸️ **LangGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
             with st.expander("Sources & Actions"):
                 if trace.get("tool_called"):
                     st.success(f"Action Executed: `{trace['tool_called']}`")
