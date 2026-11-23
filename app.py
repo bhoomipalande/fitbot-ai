@@ -73,6 +73,46 @@ MODELS = [
     "gemini-3.8-flash",
 ]
 
+BRANCH_MONTHLY_BUDGET_INR = {
+    "FitZone Pune": 30000,
+    "FitZone Mumbai": 45000,
+}
+
+WEEKLY_ROUTINE_PREVIEW = {
+    "Beginner": [
+        "Day 1 (Mon): Full Body Foundations — Squats, Push-ups, Seated Row, Plank (40 mins)",
+        "Day 2 (Tue): Brisk Cardio & Core Mobility — Treadmill Walk + Deadbugs (30 mins)",
+        "Day 3 (Wed): Upper Body & Posture — Lat Pulldown, Dumbbell Press, Face Pulls (40 mins)",
+        "Day 4 (Thu): Active Recovery & Stretching (25 mins)",
+        "Day 5 (Fri): Lower Body & Glutes — Leg Press, Lunges, Calf Raises (40 mins)",
+        "Day 6 (Sat): Light Zumba / Cycling + Core (35 mins)",
+    ],
+    "Intermediate": [
+        "Day 1 (Mon): Push (Chest, Shoulders, Triceps) — Bench Press, OHP, Dips (55 mins)",
+        "Day 2 (Tue): Pull (Back, Biceps, Rear Delts) — Pull-ups, Barbell Row, Curls (55 mins)",
+        "Day 3 (Wed): Legs & Core — Barbell Squats, RDL, Hanging Leg Raises (60 mins)",
+        "Day 4 (Thu): HIIT Conditioning & Mobility (40 mins)",
+        "Day 5 (Fri): Upper Hypertrophy — Incline DB Press, Cable Row, Lateral Raises (55 mins)",
+        "Day 6 (Sat): Lower Strength & Sled Push (50 mins)",
+    ],
+    "Advanced": [
+        "Day 1 (Mon): Heavy Chest & Triceps (65 mins)",
+        "Day 2 (Tue): Heavy Back & Posterior Chain (65 mins)",
+        "Day 3 (Wed): Quad-Focused Legs & Core (70 mins)",
+        "Day 4 (Thu): Shoulders, Arms & Conditioning (60 mins)",
+        "Day 5 (Fri): Hamstring & Glute Power Day (65 mins)",
+        "Day 6 (Sat): Athletic Metcon & Mobility (50 mins)",
+    ],
+    "Pro": [
+        "Day 1 (Mon): Maximal Strength Upper + Speed Work (75 mins)",
+        "Day 2 (Tue): Maximal Strength Lower + Plyometrics (75 mins)",
+        "Day 3 (Wed): Zone 2 Endurance + Core Stability (50 mins)",
+        "Day 4 (Thu): Push Hypertrophy Volume (70 mins)",
+        "Day 5 (Fri): Pull Hypertrophy Volume (70 mins)",
+        "Day 6 (Sat): Legs Volume + Conditioning Finisher (75 mins)",
+    ],
+}
+
 
 # =========================================================
 # SECURITY & PASSWORD HASHING HELPERS
@@ -121,6 +161,9 @@ if "selected_activity" not in st.session_state:
 if "workout_request" not in st.session_state:
     st.session_state["workout_request"] = None
 
+if "latest_generated_plan" not in st.session_state:
+    st.session_state["latest_generated_plan"] = None
+
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
@@ -153,7 +196,7 @@ if "rag_embeddings" not in st.session_state:
 
 
 # =========================================================
-# SUPABASE HELPERS (AUTH, BOOKINGS, REMINDERS & CHATS)
+# SUPABASE HELPERS & DEFAULT STAFF SEEDING
 # =========================================================
 
 def get_member_record(member_id: str) -> dict | None:
@@ -168,9 +211,11 @@ def get_member_record(member_id: str) -> dict | None:
         )
         if res.data:
             return res.data[0]
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Database lookup error: {e}")
     return None
+
+
 def ensure_default_staff():
     if not supabase:
         return
@@ -188,25 +233,47 @@ def ensure_default_staff():
         },
         {
             "member_id": "REC-PUN-01",
-            "full_name": "Pune Front Desk",
+            "full_name": "Pune Reception Desk",
             "email": "reception.pune@fitbot.ai",
             "phone_last4": "1111",
             "password_hash": hash_password("RECEP123"),
             "is_activated": True,
             "role": "reception",
             "gym_name": "FitZone Pune",
-            "plan_type": "Front Desk Staff",
+            "plan_type": "Front Desk PC",
         },
         {
             "member_id": "REC-MUM-01",
-            "full_name": "Mumbai Front Desk",
+            "full_name": "Mumbai Reception Desk",
             "email": "reception.mumbai@fitbot.ai",
             "phone_last4": "2222",
             "password_hash": hash_password("RECEP123"),
             "is_activated": True,
             "role": "reception",
             "gym_name": "FitZone Mumbai",
-            "plan_type": "Front Desk Staff",
+            "plan_type": "Front Desk PC",
+        },
+        {
+            "member_id": "TRN-RAHUL",
+            "full_name": "Rahul Sharma",
+            "email": "rahul@fitbot.ai",
+            "phone_last4": "0001",
+            "password_hash": hash_password("TRAINER123"),
+            "is_activated": True,
+            "role": "trainer",
+            "gym_name": "FitZone Pune",
+            "plan_type": "Senior PT Coach",
+        },
+        {
+            "member_id": "TRN-PRIYA",
+            "full_name": "Priya Mehta",
+            "email": "priya@fitbot.ai",
+            "phone_last4": "0002",
+            "password_hash": hash_password("TRAINER123"),
+            "is_activated": True,
+            "role": "trainer",
+            "gym_name": "FitZone Mumbai",
+            "plan_type": "PT & Functional Coach",
         },
     ]
     for staff in defaults:
@@ -219,6 +286,7 @@ def ensure_default_staff():
 if "staff_seeded" not in st.session_state:
     ensure_default_staff()
     st.session_state["staff_seeded"] = True
+
 
 def fetch_gym_by_name(gym_name: str) -> dict:
     fallback = {
@@ -238,13 +306,17 @@ def fetch_gym_by_name(gym_name: str) -> dict:
     return fallback
 
 
-def fetch_gym_bookings(gym_name: str, member_filter: str | None = None) -> list[dict]:
+def fetch_gym_bookings(gym_name: str | None = None, member_filter: str | None = None, trainer_filter: str | None = None) -> list[dict]:
     if not supabase:
         return []
     try:
-        query = supabase.table("bookings").select("*").eq("gym_name", gym_name)
+        query = supabase.table("bookings").select("*")
+        if gym_name:
+            query = query.eq("gym_name", gym_name)
         if member_filter:
             query = query.ilike("member_name", f"%{member_filter}%")
+        if trainer_filter:
+            query = query.ilike("trainer_name", f"%{trainer_filter}%")
         res = query.order("created_at", desc=True).execute()
         return res.data or []
     except Exception:
@@ -264,20 +336,72 @@ def fetch_gym_reminders(gym_name: str, member_filter: str | None = None) -> list
         return []
 
 
-def fetch_branch_members(gym_name: str) -> list[dict]:
+def fetch_branch_members(gym_name: str | None = None) -> list[dict]:
     if not supabase:
         return []
     try:
-        res = (
-            supabase.table("members")
-            .select("member_id, full_name, email, phone_last4, role, gym_name, plan_type, is_activated")
-            .eq("gym_name", gym_name)
-            .order("created_at", desc=True)
-            .execute()
-        )
+        q = supabase.table("members").select("member_id, full_name, email, phone_last4, role, gym_name, plan_type, is_activated")
+        if gym_name:
+            q = q.eq("gym_name", gym_name)
+        res = q.order("created_at", desc=True).execute()
         return res.data or []
     except Exception:
         return []
+
+
+def fetch_payments(gym_name: str | None = None) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        q = supabase.table("payments").select("*")
+        if gym_name:
+            q = q.eq("gym_name", gym_name)
+        res = q.order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def fetch_expenses(gym_name: str | None = None) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        q = supabase.table("expenses").select("*")
+        if gym_name:
+            q = q.eq("gym_name", gym_name)
+        res = q.order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def fetch_member_saved_plan(member_id: str) -> dict | None:
+    if not supabase:
+        return None
+    try:
+        res = supabase.table("member_plans").select("*").eq("member_id", member_id).execute()
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    return None
+
+
+def save_member_plan_record(member_id: str, gym_name: str, level: str, plan_text: str):
+    if not supabase:
+        return
+    try:
+        supabase.table("member_plans").upsert({
+            "member_id": member_id,
+            "gym_name": gym_name,
+            "level": level,
+            "plan_text": plan_text,
+            "completed_days": 0,
+            "missed_days": 0,
+            "last_status": "Active — Ready for Day 1",
+        }, on_conflict="member_id").execute()
+    except Exception:
+        pass
 
 
 def create_chat_session(gym_name: str, first_msg: str, owner_tag: str) -> str | None:
@@ -400,11 +524,8 @@ if st.session_state["auth_user"] is None:
         st.error(f"🔒 Too many failed attempts. Please wait **{wait_sec} seconds** before trying again.")
         st.stop()
 
-    login_tab, activate_tab = st.tabs([" Login", " ID Activation"])
+    login_tab, activate_tab = st.tabs(["🔑 Login", "🆕 ID Activation"])
 
-    # -----------------------------------------------------
-    # TAB 1: LOGIN
-    # -----------------------------------------------------
     with login_tab:
         st.markdown("Enter your issued ID and password to access your branch.")
         with st.form("member_login_form"):
@@ -416,10 +537,10 @@ if st.session_state["auth_user"] is None:
             record = get_member_record(in_id)
             if not record:
                 st.session_state["failed_attempts"] += 1
-                st.error(" Invalid ID. Please check the ID issued by your branch.")
+                st.error("❌ Invalid ID. Please check the ID issued by your branch.")
             elif not record.get("is_activated"):
                 st.warning(
-                    " This ID has not been activated yet. "
+                    "⚠️ This ID has not been activated yet. "
                     "Switch to the **🆕 ID Activation** tab to verify your details and generate your password."
                 )
             elif not verify_password(in_pass, record.get("password_hash")):
@@ -427,7 +548,7 @@ if st.session_state["auth_user"] is None:
                 if st.session_state["failed_attempts"] >= 5:
                     st.session_state["lockout_until"] = time.time() + 60
                     st.session_state["failed_attempts"] = 0
-                st.error(" Incorrect password.")
+                st.error("❌ Incorrect password.")
             else:
                 st.session_state["failed_attempts"] = 0
                 st.session_state["auth_user"] = record
@@ -436,9 +557,6 @@ if st.session_state["auth_user"] is None:
                 st.session_state["current_session_id"] = None
                 st.rerun()
 
-    # -----------------------------------------------------
-    # TAB 2: ID ACTIVATION
-    # -----------------------------------------------------
     with activate_tab:
         st.markdown("Verify your registered details to generate your personal login password.")
         with st.form("activate_id_form"):
@@ -451,7 +569,7 @@ if st.session_state["auth_user"] is None:
         if submit_activate:
             record = get_member_record(act_id)
             if not record:
-                st.error(" ID not found in our records.")
+                st.error("❌ ID not found in our records.")
             elif record.get("is_activated"):
                 st.error(
                     "🔒 This ID has already been activated. "
@@ -476,25 +594,26 @@ if st.session_state["auth_user"] is None:
                             f"- **Issued ID:** `{record['member_id']}`\n"
                             f"- **Generated Password:** `{new_plain_pass}`\n"
                             f"- **Branch:** {record['gym_name']}\n\n"
-                            f"Switch to the ** Login** tab to enter."
+                            f"Switch to the **🔑 Login** tab to enter."
                         )
                     except Exception as e:
                         st.error(f"Database error during activation: {e}")
                 else:
                     st.session_state["failed_attempts"] += 1
-                    st.error(" Verification details do not match our records. Please check and try again.")
+                    st.error("❌ Verification details do not match our records. Please check and try again.")
 
     st.stop()
 
 
 # =========================================================
-# AUTHENTICATED PORTAL (OWNER, RECEPTION & MEMBER ROLES)
+# AUTHENTICATED PORTAL (OWNER, RECEPTION, TRAINER & MEMBER)
 # =========================================================
 
 current_user = st.session_state["auth_user"]
 user_role = current_user.get("role", "member")
 is_owner = user_role == "owner"
 is_reception = user_role == "reception"
+is_trainer = user_role == "trainer"
 is_staff = is_owner or is_reception
 
 # =========================================================
@@ -505,14 +624,16 @@ with st.sidebar:
     if is_owner:
         role_badge = "👑 OWNER ADMIN"
     elif is_reception:
-        role_badge = "🛎️ RECEPTION DESK"
+        role_badge = "🛎️ RECEPTION PC"
+    elif is_trainer:
+        role_badge = "💪 PT COACH"
     else:
-        role_badge = "🏋️ VERIFIED MEMBER"
+        role_badge = "🏋️ MEMBER"
 
     st.markdown(f"### {role_badge}")
     st.caption(f"**{current_user['full_name']}** • ID: `{current_user['member_id']}`")
 
-    if st.button(" Log Out", use_container_width=True):
+    if st.button("🚪 Log Out", use_container_width=True):
         st.session_state["auth_user"] = None
         st.session_state["messages"] = []
         st.session_state["current_session_id"] = None
@@ -522,9 +643,8 @@ with st.sidebar:
 
     st.divider()
 
-    # OWNER CAN SWITCH BETWEEN MUMBAI & PUNE; RECEPTION & MEMBERS ARE LOCKED TO THEIR BRANCH
     if is_owner:
-        st.markdown("### 🏢 Multi-Branch Switcher")
+        st.markdown("### 🏢 Branch Control")
         gyms_list = [st.session_state["active_gym"]]
         if supabase:
             try:
@@ -538,7 +658,7 @@ with st.sidebar:
         current_name = st.session_state["active_gym"]["name"]
         default_idx = gym_names.index(current_name) if current_name in gym_names else 0
 
-        chosen_gym_name = st.selectbox("Select Branch (Owner Access)", gym_names, index=default_idx)
+        chosen_gym_name = st.selectbox("Active Branch View", gym_names, index=default_idx)
         for g in gyms_list:
             if g["name"] == chosen_gym_name:
                 st.session_state["active_gym"] = g
@@ -600,7 +720,7 @@ with st.sidebar:
 
     if is_owner:
         st.divider()
-        st.markdown("### Branch RAG Policies")
+        st.markdown("### 📚 Branch RAG Policies")
         st.caption(f"Indexed docs: **{len(st.session_state['rag_docs'])}**")
         uploaded_doc = st.file_uploader("Upload Policy (.txt / .md)", type=["txt", "md"])
         if uploaded_doc is not None:
@@ -615,7 +735,7 @@ with st.sidebar:
 
 
 # =========================================================
-# AGENTIC TOOLS (PERSONALIZED TO LOGGED-IN USER)
+# AGENTIC TOOLS
 # =========================================================
 
 def calculate_macros(weight_kg: float, goal: str) -> str:
@@ -703,7 +823,7 @@ def set_gym_reminder(
 
 
 # =========================================================
-# HELPER — CALL GEMINI (FOR WORKOUT GENERATOR)
+# HELPER — CALL GEMINI
 # =========================================================
 
 def call_gemini(prompt: str) -> str:
@@ -897,21 +1017,49 @@ if st.session_state["chat_open"]:
 else:
 
     # =====================================================
-    # HOME SCREEN
+    # HOME SCREEN (ROLE-SPECIFIC COMMAND CENTER)
     # =====================================================
 
     if st.session_state["selected_category"] is None:
         show_header()
 
         active_gym = st.session_state["active_gym"]
-        member_filter = None if is_staff else current_user["member_id"]
-        branch_bookings = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
-        branch_reminders = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Active Branch", active_gym["city"], active_gym["name"])
-        m2.metric("PT Bookings", f"{len(branch_bookings)}", "Branch Total" if is_staff else "Your Sessions")
-        m3.metric("Reminders", f"{len(branch_reminders)}", "Scheduled")
+        # 1. OWNER KPI BAR
+        if is_owner:
+            payments_data = fetch_payments(active_gym["name"])
+            expenses_data = fetch_expenses(active_gym["name"])
+            branch_members = [m for m in fetch_branch_members(active_gym["name"]) if m.get("role") == "member"]
+
+            total_rev = sum(float(p["amount_inr"]) for p in payments_data if p.get("status") == "Paid")
+            pending_dues = sum(float(p["amount_inr"]) for p in payments_data if p.get("status") == "Pending")
+            total_exp = sum(float(e["amount_inr"]) for e in expenses_data)
+            budget_limit = BRANCH_MONTHLY_BUDGET_INR.get(active_gym["name"], 30000)
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Revenue", f"₹{total_rev:,.0f}", f"Dues: ₹{pending_dues:,.0f}")
+            k2.metric("Budget Spent", f"₹{total_exp:,.0f}", f"of ₹{budget_limit:,.0f}")
+            k3.metric("Net Profit", f"₹{total_rev - total_exp:,.0f}", active_gym["city"])
+            k4.metric("Members", f"{len(branch_members)}", f"{sum(1 for m in branch_members if m.get('is_activated'))} Active")
+
+        # 2. TRAINER KPI BAR
+        elif is_trainer:
+            my_pt_sessions = fetch_gym_bookings(active_gym["name"], trainer_filter=current_user["full_name"])
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Coach Branch", active_gym["city"], active_gym["name"])
+            m2.metric("Assigned PT Clients", f"{len(my_pt_sessions)}", "Active Roster")
+            m3.metric("Specialty", "PT & Strength", "On Duty")
+
+        # 3. RECEPTION & MEMBER KPI BAR
+        else:
+            member_filter = None if is_reception else current_user["member_id"]
+            branch_bookings = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
+            branch_reminders = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Active Branch", active_gym["city"], active_gym["name"])
+            m2.metric("PT Bookings", f"{len(branch_bookings)}", "Branch Total" if is_reception else "Your Sessions")
+            m3.metric("Reminders", f"{len(branch_reminders)}", "Scheduled")
 
         st.write("")
         workout, activities, trainers, gym_info = show_categories()
@@ -932,36 +1080,76 @@ else:
             st.session_state["selected_category"] = "gym_info"
             st.rerun()
 
-        if is_staff:
+        # ROLE-SPECIFIC ACTION BUTTONS
+        if is_owner:
             b1, b2, b3, b4 = st.columns(4, gap="small")
             with b1:
-                if st.button("MACROS", key="open_calculator", use_container_width=True):
-                    st.session_state["selected_category"] = "calculator"
+                if st.button("💼 BUSINESS", key="open_business", use_container_width=True):
+                    st.session_state["selected_category"] = "business_finance"
                     st.rerun()
             with b2:
-                if st.button("BOOKINGS", key="open_bookings", use_container_width=True):
+                if st.button("📋 BOOKINGS", key="open_bookings", use_container_width=True):
                     st.session_state["selected_category"] = "bookings"
                     st.rerun()
             with b3:
-                if st.button(" REMINDERS", key="open_reminders", use_container_width=True):
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
                     st.session_state["selected_category"] = "reminders"
                     st.rerun()
             with b4:
-                if st.button(" MEMBERS", key="open_members", use_container_width=True):
+                if st.button("🪪 MEMBERS", key="open_members", use_container_width=True):
                     st.session_state["selected_category"] = "members_admin"
                     st.rerun()
-        else:
-            b1, b2, b3 = st.columns(3, gap="small")
+
+        elif is_reception:
+            b1, b2, b3, b4 = st.columns(4, gap="small")
             with b1:
-                if st.button("BMI & MACROS", key="open_calculator", use_container_width=True):
-                    st.session_state["selected_category"] = "calculator"
+                if st.button("💳 COLLECT FEE", key="open_rec_pay", use_container_width=True):
+                    st.session_state["selected_category"] = "reception_payments"
                     st.rerun()
             with b2:
-                if st.button(" MY BOOKINGS", key="open_bookings", use_container_width=True):
+                if st.button("📋 BOOKINGS", key="open_bookings", use_container_width=True):
                     st.session_state["selected_category"] = "bookings"
                     st.rerun()
             with b3:
-                if st.button(" REMINDERS", key="open_reminders", use_container_width=True):
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                    st.session_state["selected_category"] = "reminders"
+                    st.rerun()
+            with b4:
+                if st.button("🪪 MEMBERS", key="open_members", use_container_width=True):
+                    st.session_state["selected_category"] = "members_admin"
+                    st.rerun()
+
+        elif is_trainer:
+            b1, b2, b3 = st.columns(3, gap="small")
+            with b1:
+                if st.button("💪 MY PT CLIENTS", key="open_trainer_hub", use_container_width=True):
+                    st.session_state["selected_category"] = "trainer_hub"
+                    st.rerun()
+            with b2:
+                if st.button("📊 MACROS", key="open_calculator", use_container_width=True):
+                    st.session_state["selected_category"] = "calculator"
+                    st.rerun()
+            with b3:
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                    st.session_state["selected_category"] = "reminders"
+                    st.rerun()
+
+        else:
+            b1, b2, b3, b4 = st.columns(4, gap="small")
+            with b1:
+                if st.button("💪 MY ROUTINE", key="open_my_routine", use_container_width=True):
+                    st.session_state["selected_category"] = "my_routine"
+                    st.rerun()
+            with b2:
+                if st.button("📊 MACROS", key="open_calculator", use_container_width=True):
+                    st.session_state["selected_category"] = "calculator"
+                    st.rerun()
+            with b3:
+                if st.button("📋 BOOKINGS", key="open_bookings", use_container_width=True):
+                    st.session_state["selected_category"] = "bookings"
+                    st.rerun()
+            with b4:
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
                     st.session_state["selected_category"] = "reminders"
                     st.rerun()
 
@@ -997,6 +1185,302 @@ else:
             save_chat_message(sess_id, "user", clean_msg)
             st.session_state["chat_open"] = True
             st.rerun()
+
+    # =====================================================
+    # OWNER ONLY: BUSINESS, PAYMENTS & BUDGET HUB
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "business_finance" and is_owner:
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">BUSINESS &</span> '
+            '<span style="color:#B7F34A !important;">BUDGET</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            f'<p class="general-page-subtitle">'
+            f'Revenue, pending dues, operating budget, and Pune vs. Mumbai performance.'
+            f'</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_business"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        payments_data = fetch_payments(active_gym["name"])
+        expenses_data = fetch_expenses(active_gym["name"])
+        total_rev = sum(float(p["amount_inr"]) for p in payments_data if p.get("status") == "Paid")
+        pending_dues = sum(float(p["amount_inr"]) for p in payments_data if p.get("status") == "Pending")
+        total_exp = sum(float(e["amount_inr"]) for e in expenses_data)
+        budget_limit = BRANCH_MONTHLY_BUDGET_INR.get(active_gym["name"], 30000)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Collected Revenue", f"₹{total_rev:,.0f}", f"Pending: ₹{pending_dues:,.0f}")
+        m2.metric("Expenses / Budget", f"₹{total_exp:,.0f}", f"Limit: ₹{budget_limit:,.0f}")
+        m3.metric("Net Branch Profit", f"₹{total_rev - total_exp:,.0f}")
+
+        st.progress(min(total_exp / budget_limit, 1.0) if budget_limit else 0.0)
+
+        tab_pay, tab_exp, tab_all = st.tabs(["💳 Payments Ledger", "🧾 Budget & Expenses", "🏢 Pune vs Mumbai"])
+
+        with tab_pay:
+            with st.expander("➕ Record Payment", expanded=False):
+                with st.form("record_pay_form", clear_on_submit=True):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        p_id = st.text_input("Member ID", placeholder="e.g., FZ-PUN-1001")
+                        p_name = st.text_input("Member Name", placeholder="e.g., Rohan Kulkarni")
+                        p_plan = st.selectbox("Plan", ["Monthly", "Quarterly Pro", "Annual Elite", "Personal Training"])
+                    with c2:
+                        p_amt = st.number_input("Amount (₹)", min_value=100, max_value=100000, value=3999, step=500)
+                        p_mode = st.selectbox("Payment Mode", ["UPI", "Card", "Cash"])
+                        p_stat = st.selectbox("Status", ["Paid", "Pending"])
+
+                    if st.form_submit_button("SAVE PAYMENT", use_container_width=True):
+                        if p_id.strip() and p_name.strip() and supabase:
+                            supabase.table("payments").insert({
+                                "gym_name": active_gym["name"],
+                                "member_id": p_id.strip().upper(),
+                                "member_name": p_name.strip(),
+                                "plan_type": p_plan,
+                                "amount_inr": p_amt,
+                                "payment_mode": p_mode,
+                                "status": p_stat,
+                            }).execute()
+                            st.success("Payment saved!")
+                            st.rerun()
+
+            if payments_data:
+                df_p = pd.DataFrame(payments_data)
+                cols = [c for c in ["member_id", "member_name", "plan_type", "amount_inr", "payment_mode", "status"] if c in df_p.columns]
+                st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+
+        with tab_exp:
+            with st.expander("➕ Log Expense", expanded=False):
+                with st.form("record_exp_form", clear_on_submit=True):
+                    e1, e2, e3 = st.columns(3)
+                    with e1:
+                        e_cat = st.selectbox("Category", ["Trainer Payroll", "Rent & Utilities", "Equipment", "Marketing"])
+                    with e2:
+                        e_desc = st.text_input("Description", placeholder="e.g., AC Servicing")
+                    with e3:
+                        e_amt = st.number_input("Amount (₹)", min_value=100, max_value=200000, value=2500, step=250)
+
+                    if st.form_submit_button("SAVE EXPENSE", use_container_width=True):
+                        if e_desc.strip() and supabase:
+                            supabase.table("expenses").insert({
+                                "gym_name": active_gym["name"],
+                                "category": e_cat,
+                                "description": e_desc.strip(),
+                                "amount_inr": e_amt,
+                            }).execute()
+                            st.success("Expense logged!")
+                            st.rerun()
+
+            if expenses_data:
+                df_e = pd.DataFrame(expenses_data)
+                cols = [c for c in ["category", "description", "amount_inr"] if c in df_e.columns]
+                st.dataframe(df_e[cols], use_container_width=True, hide_index=True)
+
+        with tab_all:
+            all_p = fetch_payments(None)
+            all_e = fetch_expenses(None)
+            all_m = fetch_branch_members(None)
+            rows = []
+            for b in ["FitZone Pune", "FitZone Mumbai"]:
+                rev = sum(float(p["amount_inr"]) for p in all_p if p["gym_name"] == b and p["status"] == "Paid")
+                dues = sum(float(p["amount_inr"]) for p in all_p if p["gym_name"] == b and p["status"] == "Pending")
+                exp = sum(float(e["amount_inr"]) for e in all_e if e["gym_name"] == b)
+                m_cnt = sum(1 for m in all_m if m["gym_name"] == b and m["role"] == "member")
+                rows.append({
+                    "Branch": b,
+                    "Members": m_cnt,
+                    "Revenue (₹)": rev,
+                    "Pending (₹)": dues,
+                    "Expenses (₹)": exp,
+                    "Net Profit (₹)": rev - exp,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # =====================================================
+    # RECEPTION ONLY: COLLECT BRANCH FEES
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "reception_payments" and is_reception:
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">FRONT DESK</span> '
+            '<span style="color:#B7F34A !important;">FEE COLLECTION</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            f'<p class="general-page-subtitle">Record membership payments at {active_gym["name"]}.</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_rec_pay"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        with st.form("rec_pay_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                p_id = st.text_input("Member ID", placeholder="e.g., FZ-PUN-1001")
+                p_name = st.text_input("Member Name", placeholder="e.g., Rohan Kulkarni")
+            with c2:
+                p_plan = st.selectbox("Plan", ["Monthly", "Quarterly Pro", "Annual Elite", "Personal Training"])
+                p_amt = st.number_input("Amount (₹)", min_value=100, max_value=100000, value=1499, step=500)
+            p_mode = st.selectbox("Payment Mode", ["UPI", "Card", "Cash"])
+
+            if st.form_submit_button("✅ RECORD PAID RECEIPT", use_container_width=True):
+                if p_id.strip() and p_name.strip() and supabase:
+                    supabase.table("payments").insert({
+                        "gym_name": active_gym["name"],
+                        "member_id": p_id.strip().upper(),
+                        "member_name": p_name.strip(),
+                        "plan_type": p_plan,
+                        "amount_inr": p_amt,
+                        "payment_mode": p_mode,
+                        "status": "Paid",
+                    }).execute()
+                    st.success(f"Receipt recorded: ₹{p_amt:,} from {p_name.strip()} ({p_mode})!")
+                    st.rerun()
+
+        payments_data = fetch_payments(active_gym["name"])
+        if payments_data:
+            df_p = pd.DataFrame(payments_data)
+            cols = [c for c in ["member_id", "member_name", "plan_type", "amount_inr", "payment_mode", "status"] if c in df_p.columns]
+            st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+
+    # =====================================================
+    # TRAINER ONLY: ASSIGNED PT CLIENTS & COACHING LOG
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "trainer_hub" and is_trainer:
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">PT COACH</span> '
+            '<span style="color:#B7F34A !important;">SCHEDULE</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            f'<p class="general-page-subtitle">'
+            f'Assigned personal training sessions for Coach {current_user["full_name"]} ({active_gym["name"]}).'
+            f'</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_trainer_hub"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        my_sessions = fetch_gym_bookings(active_gym["name"], trainer_filter=current_user["full_name"])
+        if my_sessions:
+            df_t = pd.DataFrame(my_sessions)
+            cols = [c for c in ["member_name", "time_slot", "member_phone", "created_at"] if c in df_t.columns]
+            st.dataframe(df_t[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("No personal training clients assigned to your slot yet.")
+
+    # =====================================================
+    # MEMBER SMART WORKOUT ROUTINE & ATTENDANCE TRACKER
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "my_routine":
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">MY WORKOUT</span> '
+            '<span style="color:#B7F34A !important;">TRACKER</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Follow your saved routine, track today vs. tomorrow, and log completed or missed workouts.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_routine"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        saved_plan = fetch_member_saved_plan(current_user["member_id"])
+
+        if not saved_plan:
+            st.info("You don't have an active routine saved yet! Choose a level below to activate your daily tracker:")
+            chosen_lvl = st.selectbox("Select Plan Level", ["Beginner", "Intermediate", "Advanced", "Pro"])
+            if st.button("🚀 ACTIVATE THIS PLAN", use_container_width=True):
+                preview_lines = "\n".join(f"- {line}" for line in WEEKLY_ROUTINE_PREVIEW[chosen_lvl])
+                save_member_plan_record(current_user["member_id"], active_gym["name"], chosen_lvl, preview_lines)
+                st.success(f"{chosen_lvl} routine saved!")
+                st.rerun()
+        else:
+            lvl = saved_plan["level"]
+            days_list = WEEKLY_ROUTINE_PREVIEW.get(lvl, WEEKLY_ROUTINE_PREVIEW["Beginner"])
+            comp = int(saved_plan.get("completed_days") or 0)
+            missed = int(saved_plan.get("missed_days") or 0)
+
+            today_idx = comp % len(days_list)
+            tomorrow_idx = (comp + 1) % len(days_list)
+
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Active Level", lvl, saved_plan.get("last_status", "Active"))
+            s2.metric("Completed Days", f"{comp}", "On Track")
+            s3.metric("Missed Days", f"{missed}", "Catch-up Needed" if missed > 0 else "Zero Misses")
+
+            st.success(f"🔥 **TODAY'S WORKOUT:** {days_list[today_idx]}")
+            st.info(f"📅 **TOMORROW'S WORKOUT:** {days_list[tomorrow_idx]}")
+
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                if st.button("✅ COMPLETED TODAY", use_container_width=True):
+                    supabase.table("member_plans").update({
+                        "completed_days": comp + 1,
+                        "last_status": "Completed Today ✅",
+                    }).eq("member_id", current_user["member_id"]).execute()
+                    st.rerun()
+            with a2:
+                if st.button("⚠️ MISSED TODAY", use_container_width=True):
+                    supabase.table("member_plans").update({
+                        "missed_days": missed + 1,
+                        "last_status": "Missed Today — Rescheduled ⚠️",
+                    }).eq("member_id", current_user["member_id"]).execute()
+                    st.rerun()
+            with a3:
+                if st.button("🔔 REMIND TOMORROW 7 AM", use_container_width=True):
+                    tmrw = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+                    msg = set_gym_reminder(tmrw, "07:00", workout_focus=days_list[tomorrow_idx][:45])
+                    st.success(msg)
+
+            if st.session_state.get("latest_ics"):
+                rem = st.session_state["latest_ics"]
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.download_button(
+                        "📲 DOWNLOAD PHONE ALERT (.ICS)",
+                        data=rem["ics"],
+                        file_name="fitbot_workout_alert.ics",
+                        mime="text/calendar",
+                        use_container_width=True,
+                    )
+                with c2:
+                    st.link_button("📅 GOOGLE CALENDAR", url=rem["gcal"], use_container_width=True)
+
+            with st.expander("📋 View Full Saved Plan", expanded=True):
+                st.markdown(saved_plan["plan_text"])
 
     # =====================================================
     # STAFF ONLY (OWNER & RECEPTION): ISSUE IDs & ROSTER
@@ -1039,13 +1523,13 @@ else:
             with r_col1:
                 new_m_plan = st.selectbox(
                     "Membership / Role Plan",
-                    ["Monthly", "Quarterly Pro", "Annual Elite", "Front Desk Staff"]
+                    ["Monthly", "Quarterly Pro", "Annual Elite", "Front Desk Staff", "PT Coach"]
                 )
             with r_col2:
-                role_options = ["member", "reception"] if is_owner else ["member"]
+                role_options = ["member", "reception", "trainer"] if is_owner else ["member"]
                 new_m_role = st.selectbox("Account Role", role_options)
 
-            if st.form_submit_button(" ISSUE ID", use_container_width=True):
+            if st.form_submit_button("🪪 ISSUE ID", use_container_width=True):
                 if new_m_id.strip() and new_m_name.strip() and new_m_email.strip() and len(new_m_phone4.strip()) == 4 and supabase:
                     try:
                         supabase.table("members").insert({
@@ -1060,7 +1544,7 @@ else:
                             "plan_type": new_m_plan,
                         }).execute()
                         st.success(
-                            f" Issued ID **`{new_m_id.strip().upper()}`** ({new_m_role}) to **{new_m_name.strip()}** ({active_gym['name']})."
+                            f"✅ Issued ID **`{new_m_id.strip().upper()}`** ({new_m_role}) to **{new_m_name.strip()}** ({active_gym['name']})."
                         )
                     except Exception as e:
                         st.error(f"Could not create record: {e}")
@@ -1279,7 +1763,7 @@ else:
                 m3.metric("Daily Protein", f"{protein:.0f} g")
 
     # =====================================================
-    # WORKOUT PLANS
+    # WORKOUT PLANS (WITH ONE-CLICK SAVE TO MY ROUTINE)
     # =====================================================
 
     elif st.session_state["selected_category"] == "workout":
@@ -1291,7 +1775,7 @@ else:
             '</h1>'
             '<div class="general-page-divider"></div>'
             '<p class="general-page-subtitle">'
-            'Choose your fitness level and let FitBot build a structured workout plan designed for your goals.'
+            'Generate a structured workout plan and save it directly to your daily routine tracker.'
             '</p>'
             '</div>',
             unsafe_allow_html=True
@@ -1313,16 +1797,23 @@ else:
 
             if st.button("GET WORKOUT PLAN →", key="get_workout_plan", use_container_width=True):
                 st.session_state["workout_request"] = (
-                    f"Create a {workout_level} level workout plan for {current_user['full_name']}. "
+                    f"Create a {workout_level} level 6-day workout plan for {current_user['full_name']}. "
                     "Make it clear, structured, practical and suitable for a gym member."
                 )
 
         if st.session_state["workout_request"]:
             with st.spinner("Creating your workout plan..."):
                 workout_text = call_gemini(st.session_state["workout_request"])
+            st.session_state["latest_generated_plan"] = {
+                "level": workout_level,
+                "text": workout_text,
+            }
+            st.session_state["workout_request"] = None
 
+        if st.session_state.get("latest_generated_plan"):
+            gen = st.session_state["latest_generated_plan"]
             st.markdown(
-                '<div class="general-page-header" style="margin-top:40px;">'
+                '<div class="general-page-header" style="margin-top:30px;">'
                 '<h2 class="general-page-title" style="font-size:30px;">'
                 'YOUR <span>WORKOUT PLAN</span>'
                 '</h2>'
@@ -1331,13 +1822,19 @@ else:
                 unsafe_allow_html=True
             )
 
-            result_left, result_center, result_right = st.columns([0.7, 4, 0.7])
+            if st.button("💾 SAVE AS MY ACTIVE ROUTINE", use_container_width=True):
+                save_member_plan_record(
+                    current_user["member_id"],
+                    st.session_state["active_gym"]["name"],
+                    gen["level"],
+                    gen["text"],
+                )
+                st.success("✅ Saved! Open **💪 MY ROUTINE** from the Home screen to track Today, Tomorrow, and Missed days.")
 
+            result_left, result_center, result_right = st.columns([0.7, 4, 0.7])
             with result_center:
                 st.markdown('<div class="workout-result-label">PERSONALIZED TRAINING PROGRAM</div>', unsafe_allow_html=True)
-                st.markdown(workout_text)
-
-            st.session_state["workout_request"] = None
+                st.markdown(gen["text"])
 
     # =====================================================
     # ACTIVITIES
