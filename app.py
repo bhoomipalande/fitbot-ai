@@ -171,7 +171,54 @@ def get_member_record(member_id: str) -> dict | None:
     except Exception:
         pass
     return None
+def ensure_default_staff():
+    if not supabase:
+        return
+    defaults = [
+        {
+            "member_id": "OWN-BHOOMI",
+            "full_name": "Bhoomi Palande",
+            "email": "bhoomi@fitbot.ai",
+            "phone_last4": "0000",
+            "password_hash": hash_password("OWNER123"),
+            "is_activated": True,
+            "role": "owner",
+            "gym_name": "FitZone Pune",
+            "plan_type": "All-Access Owner",
+        },
+        {
+            "member_id": "REC-PUN-01",
+            "full_name": "Pune Front Desk",
+            "email": "reception.pune@fitbot.ai",
+            "phone_last4": "1111",
+            "password_hash": hash_password("RECEP123"),
+            "is_activated": True,
+            "role": "reception",
+            "gym_name": "FitZone Pune",
+            "plan_type": "Front Desk Staff",
+        },
+        {
+            "member_id": "REC-MUM-01",
+            "full_name": "Mumbai Front Desk",
+            "email": "reception.mumbai@fitbot.ai",
+            "phone_last4": "2222",
+            "password_hash": hash_password("RECEP123"),
+            "is_activated": True,
+            "role": "reception",
+            "gym_name": "FitZone Mumbai",
+            "plan_type": "Front Desk Staff",
+        },
+    ]
+    for staff in defaults:
+        try:
+            supabase.table("members").upsert(staff, on_conflict="member_id").execute()
+        except Exception:
+            pass
 
+
+if "staff_seeded" not in st.session_state:
+    ensure_default_staff()
+    st.session_state["staff_seeded"] = True
 
 def fetch_gym_by_name(gym_name: str) -> dict:
     fallback = {
