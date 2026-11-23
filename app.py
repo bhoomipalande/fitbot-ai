@@ -7,9 +7,9 @@ from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
-from gym_data import GYM_DATA
-from rag_engine import DEFAULT_KNOWLEDGE_DOCS, embed_texts, retrieve_relevant_context
 from agent_graph import build_fitbot_graph
+from gym_data import GYM_DATA
+from rag_engine import DEFAULT_KNOWLEDGE_DOCS, embed_texts
 from styles import load_css
 from ui import show_header, show_categories
 
@@ -214,7 +214,7 @@ with st.sidebar:
 # =========================================================
 
 def calculate_macros(weight_kg: float, goal: str) -> str:
-    """Calculates daily calories and macronutrients based on weight in kg and fitness goal (e.g., 'weight loss', 'muscle gain')."""
+    """Calculates daily calories and macronutrients based on weight in kg and fitness goal."""
     st.session_state["last_tool_used"] = f"calculate_macros(weight_kg={weight_kg}, goal='{goal}')"
     if "loss" in goal.lower():
         calories = weight_kg * 22
@@ -232,7 +232,7 @@ def book_trainer_session(
     member_name: str = "Walk-in Member",
     member_phone: str = "Not Provided"
 ) -> str:
-    """Books a personal training session with a specific trainer at a specific time and saves it to the gym's Supabase database."""
+    """Books a personal training session and saves it to the gym's Supabase database."""
     st.session_state["last_tool_used"] = (
         f"book_trainer_session(trainer='{trainer_name}', slot='{time_slot}', member='{member_name}')"
     )
@@ -258,30 +258,23 @@ def book_trainer_session(
 
 
 # =========================================================
-# HELPER — CALL GEMINI WITH RETRY & FALLBACK
+# HELPER — CALL GEMINI (FOR WORKOUT GENERATOR)
 # =========================================================
 
-def call_gemini(prompt: str, use_tools: bool = False) -> str:
+def call_gemini(prompt: str) -> str:
     if not api_key:
         return "Service configuration error: GEMINI_API_KEY is missing."
 
     last_error = ""
-
     for model_name in MODELS:
-        config_kwargs = {"temperature": 0.4}
-
-        if use_tools:
-            config_kwargs["tools"] = [calculate_macros, book_trainer_session]
-
         for attempt in range(2):
             try:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
-                    config=types.GenerateContentConfig(**config_kwargs)
+                    config=types.GenerateContentConfig(temperature=0.4),
                 )
                 return response.text
-
             except Exception as e:
                 last_error = str(e)
                 if "503" in last_error and attempt == 0:
@@ -295,8 +288,9 @@ def call_gemini(prompt: str, use_tools: bool = False) -> str:
 
 
 # =========================================================
-# AGENTIC WORKFLOW — RAG RETRIEVAL + TOOL ROUTING
+# AGENTIC WORKFLOW — LANGGRAPH STATEGRAPH EXECUTION
 # =========================================================
+
 def generate_fitbot_response() -> tuple[str, dict]:
     active_gym = st.session_state["active_gym"]
     st.session_state["last_tool_used"] = None
@@ -339,6 +333,7 @@ def generate_fitbot_response() -> tuple[str, dict]:
     }
     return final_state["final_response"], trace
 
+
 # =========================================================
 # CHAT SCREEN
 # =========================================================
@@ -377,10 +372,10 @@ if st.session_state["chat_open"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("trace"):
-                if trace.get("nodes_visited"):
-                 st.caption(f"🕸️ **LangGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
-                with st.expander("Sources & Actions"):
+                with st.expander("Sources & Agent Execution"):
                     trace = message["trace"]
+                    if trace.get("nodes_visited"):
+                        st.caption(f"🕸️ **StateGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
                     if trace.get("tool_called"):
                         st.success(f"Action Executed: `{trace['tool_called']}`")
                     st.markdown("**Referenced Club Policies:**")
@@ -389,11 +384,12 @@ if st.session_state["chat_open"]:
 
     if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
         with st.chat_message("assistant"):
-            with st.spinner("Checking club policies & availability..."):
+            with st.spinner("Running FitBot Agent Graph..."):
                 assistant_reply, trace = generate_fitbot_response()
             st.markdown(assistant_reply)
-            st.caption(f"🕸️ **LangGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
-            with st.expander("Sources & Actions"):
+            with st.expander("Sources & Agent Execution"):
+                if trace.get("nodes_visited"):
+                    st.caption(f"🕸️ **StateGraph Execution Path:** `{' → '.join(trace['nodes_visited'])}`")
                 if trace.get("tool_called"):
                     st.success(f"Action Executed: `{trace['tool_called']}`")
                 st.markdown("**Referenced Club Policies:**")
@@ -429,7 +425,6 @@ else:
         active_gym = st.session_state["active_gym"]
         branch_bookings = fetch_gym_bookings(active_gym["name"])
 
-        # Live Branch Status Strip
         m1, m2, m3 = st.columns(3)
         m1.metric("Active Branch", active_gym["city"], active_gym["name"])
         m2.metric("Standard Plan", active_gym["monthly_fee"], "Full Floor Access")
@@ -667,7 +662,7 @@ else:
 
         if st.session_state["workout_request"]:
             with st.spinner("Creating your workout plan..."):
-                workout_text = call_gemini(st.session_state["workout_request"], use_tools=False)
+                workout_text = call_gemini(st.session_state["workout_request"])
 
             st.markdown(
                 '<div class="general-page-header" style="margin-top:40px;">'
@@ -823,4 +818,4 @@ else:
 
             with col2:
                 st.markdown(f"### Membership\n\n**Standard Plan**  \n{active_gym['monthly_fee']}\n\n- Full gym floor access\n- Group fitness classes\n- AI workout & macro guidance")
-                st.markdown(f"### About\n\n{active_gym['name']} in {active_gym['city']} is powered by FitBot AI to streamline member onboarding, personal training bookings, and workout guidance.")
+                st.markdown(f"### About\n\n{active_gym['name']} in {active_gym['city']} is powered by FitBot AI to streamline member onboarding, personal training bookings, and workout guidance.")git add .

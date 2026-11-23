@@ -1,11 +1,57 @@
 import json
 import re
 from typing import TypedDict, Callable
-from langgraph.graph import StateGraph, END
 from google import genai
 from google.genai import types
 
 from rag_engine import retrieve_relevant_context
+
+try:
+    from langgraph.graph import StateGraph, END
+except ImportError:
+    END = "__end__"
+
+    class _CompiledGraph:
+        def __init__(self, nodes, edges, cond_edges, entry):
+            self.nodes = nodes
+            self.edges = edges
+            self.cond_edges = cond_edges
+            self.entry = entry
+
+        def invoke(self, state: dict) -> dict:
+            curr = self.entry
+            while curr and curr != END:
+                updates = self.nodes[curr](state)
+                if updates:
+                    state.update(updates)
+                if curr in self.cond_edges:
+                    router_fn, mapping = self.cond_edges[curr]
+                    curr = mapping[router_fn(state)]
+                else:
+                    curr = self.edges.get(curr, END)
+            return state
+
+    class StateGraph:
+        def __init__(self, state_schema):
+            self.nodes = {}
+            self.edges = {}
+            self.cond_edges = {}
+            self.entry = None
+
+        def add_node(self, name: str, fn: Callable):
+            self.nodes[name] = fn
+
+        def set_entry_point(self, name: str):
+            self.entry = name
+
+        def add_edge(self, src: str, dst: str):
+            self.edges[src] = dst
+
+        def add_conditional_edges(self, src: str, router_fn: Callable, mapping: dict):
+            self.cond_edges[src] = (router_fn, mapping)
+
+        def compile(self):
+            return _CompiledGraph(self.nodes, self.edges, self.cond_edges, self.entry)
 
 
 class AgentState(TypedDict):
@@ -28,7 +74,7 @@ def build_fitbot_graph(
     calc_macros_fn: Callable,
     book_trainer_fn: Callable,
 ):
-    """Builds a multi-node LangGraph StateGraph for RAG + Autonomous Tool Routing."""
+    """Builds a multi-node StateGraph for Semantic RAG + Autonomous Tool Routing."""
 
     def _call_llm(prompt: str) -> str:
         for model_name in models:
@@ -173,7 +219,6 @@ INSTRUCTIONS:
             "nodes_visited": state["nodes_visited"] + ["4. generate_reply"],
         }
 
-    # Assemble & Compile LangGraph StateGraph
     workflow = StateGraph(AgentState)
     workflow.add_node("retrieve_rag", retrieve_rag_node)
     workflow.add_node("agent_router", agent_router_node)
