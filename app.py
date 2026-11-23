@@ -1,5 +1,6 @@
 import os
 import time
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
@@ -17,7 +18,7 @@ from ui import show_header, show_categories
 # =========================================================
 
 st.set_page_config(
-    page_title="FitBot AI — Agentic Gym SaaS",
+    page_title="FitBot AI — Intelligent Gym Management & Concierge",
     page_icon="🏋️",
     layout="centered"
 )
@@ -107,12 +108,32 @@ if "rag_embeddings" not in st.session_state:
 
 
 # =========================================================
-# SIDEBAR — MULTI-GYM SWITCHER + RAG KNOWLEDGE UPLOADER
+# HELPER — FETCH BOOKINGS FROM SUPABASE
+# =========================================================
+
+def fetch_gym_bookings(gym_name: str) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("bookings")
+            .select("*")
+            .eq("gym_name", gym_name)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+# =========================================================
+# SIDEBAR — MULTI-BRANCH SELECTOR & KNOWLEDGE BASE
 # =========================================================
 
 with st.sidebar:
-    st.markdown("### 🏢 Gym Tenant Switcher")
-    st.caption("White-label FitBot AI for any fitness club.")
+    st.markdown("### 🏢 Fitness Club Portal")
+    st.caption("Select an active branch or onboard a new location.")
 
     gyms_list = [st.session_state["active_gym"]]
     if supabase:
@@ -127,7 +148,7 @@ with st.sidebar:
     current_name = st.session_state["active_gym"]["name"]
     default_idx = gym_names.index(current_name) if current_name in gym_names else 0
 
-    chosen_gym_name = st.selectbox("Active Gym", gym_names, index=default_idx)
+    chosen_gym_name = st.selectbox("Active Branch", gym_names, index=default_idx)
     for g in gyms_list:
         if g["name"] == chosen_gym_name:
             st.session_state["active_gym"] = g
@@ -135,18 +156,18 @@ with st.sidebar:
 
     active_gym = st.session_state["active_gym"]
     st.info(
-        f"**{active_gym['name']}** ({active_gym['city']})\n\n"
+        f"**{active_gym['name']}** — {active_gym['city']}\n\n"
         f"🕒 {active_gym['timings']}\n\n"
-        f"💳 {active_gym['monthly_fee']}"
+        f"💳 Starting at {active_gym['monthly_fee']}"
     )
 
-    with st.expander("➕ Register a New Gym"):
-        new_gym_name = st.text_input("Gym Name", placeholder="e.g., Gold's Gym Koregaon Park")
+    with st.expander("➕ Onboard New Branch"):
+        new_gym_name = st.text_input("Club Name", placeholder="e.g., Gold's Gym Koregaon Park")
         new_gym_city = st.text_input("City", placeholder="e.g., Pune")
-        new_gym_timings = st.text_input("Timings", value="Mon-Sat: 6:00 AM - 10:00 PM")
-        new_gym_fee = st.text_input("Monthly Fee", value="₹1,999/month")
+        new_gym_timings = st.text_input("Operating Hours", value="Mon-Sat: 6:00 AM - 10:00 PM")
+        new_gym_fee = st.text_input("Base Membership", value="₹1,999/month")
 
-        if st.button("ONBOARD GYM", use_container_width=True):
+        if st.button("SAVE BRANCH", use_container_width=True):
             if new_gym_name.strip() and new_gym_city.strip():
                 new_record = {
                     "name": new_gym_name.strip(),
@@ -158,18 +179,18 @@ with st.sidebar:
                     try:
                         supabase.table("gyms").insert(new_record).execute()
                         st.session_state["active_gym"] = new_record
-                        st.success(f"{new_gym_name} registered to Supabase!")
+                        st.success(f"{new_gym_name} added successfully!")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"DB Error: {e}")
+                        st.error(f"Could not save branch: {e}")
                 else:
-                    st.warning("Connect Supabase keys first to persist new gyms.")
+                    st.warning("Configure Supabase credentials to persist branches.")
 
     st.divider()
-    st.markdown("### 📚 RAG Knowledge Base")
-    st.caption(f"Indexed policy chunks: **{len(st.session_state['rag_docs'])}**")
+    st.markdown("### 📚 Policy & Knowledge Store")
+    st.caption(f"Active documents indexed: **{len(st.session_state['rag_docs'])}**")
 
-    uploaded_doc = st.file_uploader("Upload Custom Gym Policy (.txt / .md)", type=["txt", "md"])
+    uploaded_doc = st.file_uploader("Upload Branch Policy (.txt / .md)", type=["txt", "md"])
     if uploaded_doc is not None:
         doc_text = uploaded_doc.read().decode("utf-8").strip()
         if doc_text and not any(d["title"] == uploaded_doc.name for d in st.session_state["rag_docs"]):
@@ -178,17 +199,17 @@ with st.sidebar:
             if api_key:
                 new_emb = embed_texts(client, [f"{new_doc['title']}: {new_doc['content']}"])[0]
                 st.session_state["rag_embeddings"].append(new_emb)
-            st.success(f"Indexed '{uploaded_doc.name}' into Vector Store!")
+            st.success(f"'{uploaded_doc.name}' indexed and live!")
 
     st.divider()
     if supabase:
-        st.success("🟢 Supabase PostgreSQL Connected")
+        st.success("🟢 Cloud Database Connected")
     else:
-        st.warning("🟡 Supabase Not Configured (Local Mode)")
+        st.warning("🟡 Cloud Database Offline")
 
 
 # =========================================================
-# AGENTIC TOOLS (MACRO CALCULATOR + SUPABASE BOOKING + RAG)
+# AGENTIC TOOLS (MACRO CALCULATOR + SUPABASE BOOKING)
 # =========================================================
 
 def calculate_macros(weight_kg: float, goal: str) -> str:
@@ -207,7 +228,7 @@ def calculate_macros(weight_kg: float, goal: str) -> str:
 def book_trainer_session(
     trainer_name: str,
     time_slot: str,
-    member_name: str = "Guest Member",
+    member_name: str = "Walk-in Member",
     member_phone: str = "Not Provided"
 ) -> str:
     """Books a personal training session with a specific trainer at a specific time and saves it to the gym's Supabase database."""
@@ -226,13 +247,13 @@ def book_trainer_session(
                 "time_slot": time_slot,
             }).execute()
             return (
-                f"Confirmed! Saved to {gym_name}'s PostgreSQL database: "
-                f"Session with {trainer_name} at {time_slot} for {member_name}."
+                f"Booking confirmed for {member_name} with {trainer_name} at {time_slot} "
+                f"({gym_name})."
             )
         except Exception as e:
-            return f"Database error while booking: {str(e)}"
+            return f"Unable to complete booking: {str(e)}"
 
-    return f"Session booked (local mode) with {trainer_name} at {time_slot} for {member_name}."
+    return f"Booking confirmed for {member_name} with {trainer_name} at {time_slot}."
 
 
 # =========================================================
@@ -241,7 +262,7 @@ def book_trainer_session(
 
 def call_gemini(prompt: str, use_tools: bool = False) -> str:
     if not api_key:
-        return "API key is missing. Please add GEMINI_API_KEY to your .env file or Streamlit Secrets."
+        return "Service configuration error: GEMINI_API_KEY is missing."
 
     last_error = ""
 
@@ -267,9 +288,9 @@ def call_gemini(prompt: str, use_tools: bool = False) -> str:
                     continue
                 if "503" in last_error or "404" in last_error:
                     break
-                return f"I'm temporarily unable to respond. Error: {last_error}"
+                return f"Unable to process request right now. Details: {last_error}"
 
-    return f"All Gemini models are currently busy. Please try again in a minute. (Last error: {last_error})"
+    return f"Service temporarily busy. Please retry shortly. ({last_error})"
 
 
 # =========================================================
@@ -289,7 +310,6 @@ def generate_fitbot_response() -> tuple[str, dict]:
         if message["role"] == "user":
             latest_user_query = message["content"]
 
-    # Step 1: RAG Vector Retrieval over Gym Policies & Knowledge Base
     retrieved_chunks = []
     if api_key and st.session_state["rag_embeddings"]:
         retrieved_chunks = retrieve_relevant_context(
@@ -301,33 +321,32 @@ def generate_fitbot_response() -> tuple[str, dict]:
         )
 
     rag_context_str = "\n".join(
-        [f"- [{c['title']} | Similarity: {c['score']}]: {c['content']}" for c in retrieved_chunks]
+        [f"- [{c['title']} | Relevance: {c['score']}]: {c['content']}" for c in retrieved_chunks]
     )
 
-    # Step 2: Augmented Prompt with Retrieved Context + Active Tenant + Tools
     prompt = f"""
-You are FitBot AI, an autonomous agentic gym receptionist and fitness assistant for {active_gym['name']} in {active_gym['city']}.
+You are FitBot AI, the virtual concierge and member support assistant for {active_gym['name']} in {active_gym['city']}.
 
-ACTIVE GYM PROFILE:
-- Gym Name: {active_gym['name']}
+ACTIVE BRANCH PROFILE:
+- Club Name: {active_gym['name']}
 - City: {active_gym['city']}
-- Timings: {active_gym['timings']}
-- Base Monthly Membership: {active_gym['monthly_fee']}
+- Hours: {active_gym['timings']}
+- Standard Membership: {active_gym['monthly_fee']}
 
-RETRIEVED KNOWLEDGE BASE CONTEXT (RAG):
+RETRIEVED CLUB POLICIES & GUIDELINES:
 {rag_context_str}
 
-TRAINERS & GROUP ACTIVITIES:
+TRAINERS & GROUP SESSIONS:
 {GYM_DATA}
 
 CONVERSATION HISTORY:
 {conversation_history}
 
-AGENT INSTRUCTIONS:
-1. Ground policy, freeze, refund, guest pass, pricing tier, and etiquette answers strictly in the RETRIEVED KNOWLEDGE BASE CONTEXT above.
-2. If the user asks for daily calories or protein/macros based on their weight, invoke the `calculate_macros` tool.
-3. If the user asks to book a personal trainer session, invoke the `book_trainer_session` tool immediately (use 'Guest Member' if they didn't mention a name).
-4. Keep responses helpful, structured, and concise.
+INSTRUCTIONS:
+1. Ground all policy, freeze, refund, guest pass, pricing tier, and facility answers strictly in the RETRIEVED CLUB POLICIES & GUIDELINES above.
+2. If the member asks for daily calorie or macro targets based on weight, call `calculate_macros`.
+3. If the member asks to book a personal training session, call `book_trainer_session` immediately.
+4. Keep responses warm, professional, accurate, and concise.
 """
 
     reply = call_gemini(prompt, use_tools=True)
@@ -354,7 +373,7 @@ if st.session_state["chat_open"]:
             st.rerun()
 
     with end_col:
-        if st.button("END CONVERSATION", key="end_conversation", use_container_width=True):
+        if st.button("CLEAR CHAT", key="end_conversation", use_container_width=True):
             st.session_state["messages"] = []
             st.session_state["chat_open"] = False
             st.session_state["selected_category"] = None
@@ -368,7 +387,7 @@ if st.session_state["chat_open"]:
         f'</div>'
         f'<div class="chat-page-divider"></div>'
         f'<div class="chat-page-subtitle">'
-        f'CONCIERGE FOR {st.session_state["active_gym"]["name"].upper()}'
+        f'{st.session_state["active_gym"]["name"].upper()} • MEMBER CONCIERGE'
         f'</div>'
         f'</div>',
         unsafe_allow_html=True
@@ -378,32 +397,25 @@ if st.session_state["chat_open"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("trace"):
-                with st.expander("🔍 Agent Workflow Trace (RAG + Tool Calling)"):
+                with st.expander("Sources & Actions"):
                     trace = message["trace"]
                     if trace.get("tool_called"):
-                        st.success(f"🛠️ Tool Executed: `{trace['tool_called']}`")
-                    else:
-                        st.info("🛠️ Tool Executed: None (Answered via RAG + LLM)")
-
-                    st.markdown("**📚 Top Retrieved RAG Chunks:**")
+                        st.success(f"Action Executed: `{trace['tool_called']}`")
+                    st.markdown("**Referenced Club Policies:**")
                     for src in trace.get("rag_sources", []):
-                        st.markdown(f"- **{src['title']}** (Similarity: `{src['score']}`): {src['content']}")
+                        st.markdown(f"- **{src['title']}** (Match: `{src['score']}`): {src['content']}")
 
-    # Generate response if the last message is from the user (e.g., just arrived from home screen)
     if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
         with st.chat_message("assistant"):
-            with st.spinner("Retrieving RAG context & running FitBot Agent..."):
+            with st.spinner("Checking club policies & availability..."):
                 assistant_reply, trace = generate_fitbot_response()
             st.markdown(assistant_reply)
-            with st.expander("🔍 Agent Workflow Trace (RAG + Tool Calling)"):
+            with st.expander("Sources & Actions"):
                 if trace.get("tool_called"):
-                    st.success(f"🛠️ Tool Executed: `{trace['tool_called']}`")
-                else:
-                    st.info("🛠️ Tool Executed: None (Answered via RAG + LLM)")
-
-                st.markdown("**📚 Top Retrieved RAG Chunks:**")
+                    st.success(f"Action Executed: `{trace['tool_called']}`")
+                st.markdown("**Referenced Club Policies:**")
                 for src in trace.get("rag_sources", []):
-                    st.markdown(f"- **{src['title']}** (Similarity: `{src['score']}`): {src['content']}")
+                    st.markdown(f"- **{src['title']}** (Match: `{src['score']}`): {src['content']}")
 
         st.session_state["messages"].append({
             "role": "assistant",
@@ -411,7 +423,7 @@ if st.session_state["chat_open"]:
             "trace": trace,
         })
 
-    user_message = st.chat_input("Ask about freeze policy, calculate macros, or book a trainer...")
+    user_message = st.chat_input("Ask about memberships, calculate macros, or book a trainer...")
 
     if user_message:
         st.session_state["messages"].append({"role": "user", "content": user_message})
@@ -419,7 +431,7 @@ if st.session_state["chat_open"]:
 
 
 # =========================================================
-# NORMAL APP
+# MAIN PORTAL
 # =========================================================
 
 else:
@@ -430,10 +442,17 @@ else:
 
     if st.session_state["selected_category"] is None:
         show_header()
-        st.caption(
-            f"Currently serving: **{st.session_state['active_gym']['name']}** "
-            f"({st.session_state['active_gym']['city']})"
-        )
+
+        active_gym = st.session_state["active_gym"]
+        branch_bookings = fetch_gym_bookings(active_gym["name"])
+
+        # Live Branch Status Strip
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Active Branch", active_gym["city"], active_gym["name"])
+        m2.metric("Standard Plan", active_gym["monthly_fee"], "Full Floor Access")
+        m3.metric("PT Bookings", f"{len(branch_bookings)}", "Live Synced")
+
+        st.write("")
         workout, activities, trainers, gym_info = show_categories()
 
         if workout:
@@ -459,7 +478,7 @@ else:
                 st.rerun()
 
         with b_col2:
-            if st.button("📋 LIVE BOOKINGS (DB)", key="open_bookings", use_container_width=True):
+            if st.button("📋 BOOKINGS & DESK", key="open_bookings", use_container_width=True):
                 st.session_state["selected_category"] = "bookings"
                 st.rerun()
 
@@ -477,7 +496,7 @@ else:
         with st.form("home_chat_form", clear_on_submit=True):
             first_message = st.text_input(
                 "Ask FitBot",
-                placeholder="Ask about freeze policy, calculate macros, or book a trainer...",
+                placeholder="Ask about memberships, freeze policy, nutrition, or book a trainer...",
                 label_visibility="collapsed"
             )
 
@@ -489,21 +508,22 @@ else:
             st.rerun()
 
     # =====================================================
-    # LIVE BOOKINGS (SUPABASE DB VIEW)
+    # BOOKINGS & FRONT-DESK OPERATIONS
     # =====================================================
 
     elif st.session_state["selected_category"] == "bookings":
+        active_gym = st.session_state["active_gym"]
 
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
-            '<span style="color:#F5F5F5 !important;">LIVE</span> '
-            '<span style="color:#B7F34A !important;">BOOKINGS</span>'
+            '<span style="color:#F5F5F5 !important;">BOOKINGS &</span> '
+            '<span style="color:#B7F34A !important;">FRONT DESK</span>'
             '</h1>'
             '<div class="general-page-divider"></div>'
-            '<p class="general-page-subtitle">'
-            'Real-time personal training bookings stored in Supabase PostgreSQL.'
-            '</p>'
+            f'<p class="general-page-subtitle">'
+            f'Live personal training schedule and walk-in booking desk for {active_gym["name"]}.'
+            f'</p>'
             '</div>',
             unsafe_allow_html=True
         )
@@ -512,29 +532,55 @@ else:
             st.session_state["selected_category"] = None
             st.rerun()
 
+        bookings_data = fetch_gym_bookings(active_gym["name"])
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Sessions", len(bookings_data))
+        k2.metric("Active Trainers", "3")
+        k3.metric("Branch", active_gym["city"])
+
+        with st.expander("➕ Log Walk-In / Phone Booking", expanded=False):
+            with st.form("walkin_booking_form", clear_on_submit=True):
+                wb_col1, wb_col2 = st.columns(2)
+                with wb_col1:
+                    wb_member = st.text_input("Member Name", placeholder="e.g., Rohan Kulkarni")
+                    wb_phone = st.text_input("Phone Number", placeholder="e.g., +91-98765-43210")
+                with wb_col2:
+                    wb_trainer = st.selectbox("Trainer", ["Rahul Sharma", "Priya Mehta", "Arjun Patel"])
+                    wb_slot = st.text_input("Date & Time Slot", placeholder="e.g., Tomorrow 8:00 AM")
+
+                if st.form_submit_button("CONFIRM BOOKING", use_container_width=True):
+                    if wb_member.strip() and wb_slot.strip() and supabase:
+                        try:
+                            supabase.table("bookings").insert({
+                                "gym_name": active_gym["name"],
+                                "member_name": wb_member.strip(),
+                                "member_phone": wb_phone.strip() or "Not Provided",
+                                "trainer_name": wb_trainer,
+                                "time_slot": wb_slot.strip(),
+                            }).execute()
+                            st.success("Walk-in booking recorded!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Database error: {e}")
+
+        st.subheader("Scheduled Sessions")
         if not supabase:
-            st.warning("Supabase is not connected yet. Add SUPABASE_URL and SUPABASE_KEY to view live database records.")
+            st.warning("Connect Supabase credentials to view and manage live bookings.")
+        elif bookings_data:
+            df = pd.DataFrame(bookings_data)
+            display_cols = [c for c in ["member_name", "member_phone", "trainer_name", "time_slot", "created_at"] if c in df.columns]
+            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+            csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ EXPORT SCHEDULE (CSV)",
+                data=csv_bytes,
+                file_name=f"{active_gym['name'].lower().replace(' ', '_')}_bookings.csv",
+                mime="text/csv",
+            )
         else:
-            try:
-                active_name = st.session_state["active_gym"]["name"]
-                res = (
-                    supabase.table("bookings")
-                    .select("*")
-                    .eq("gym_name", active_name)
-                    .order("created_at", desc=True)
-                    .execute()
-                )
-                if res.data:
-                    st.dataframe(
-                        res.data,
-                        column_order=["member_name", "trainer_name", "time_slot", "gym_name", "created_at"],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.info(f"No bookings yet for **{active_name}**. Ask FitBot in chat to book a trainer!")
-            except Exception as e:
-                st.error(f"Could not fetch bookings: {e}")
+            st.info(f"No sessions scheduled yet for **{active_gym['name']}**. Book via chat or use the walk-in form above.")
 
     # =====================================================
     # BMI & MACRO CALCULATOR
@@ -653,7 +699,7 @@ else:
             result_left, result_center, result_right = st.columns([0.7, 4, 0.7])
 
             with result_center:
-                st.markdown('<div class="workout-result-label">FITBOT GENERATED PLAN</div>', unsafe_allow_html=True)
+                st.markdown('<div class="workout-result-label">PERSONALIZED TRAINING PROGRAM</div>', unsafe_allow_html=True)
                 st.markdown(workout_text)
 
             st.session_state["workout_request"] = None
