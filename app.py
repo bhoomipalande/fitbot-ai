@@ -1,5 +1,9 @@
+from datetime import datetime, timedelta
+import hashlib
 import os
+import secrets
 import time
+import urllib.parse
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -34,7 +38,7 @@ else:
 
 
 # =========================================================
-# SECRETS & CLIENTS (LOCAL .ENV + STREAMLIT CLOUD)
+# SECRETS & CLIENTS
 # =========================================================
 
 load_dotenv()
@@ -71,8 +75,42 @@ MODELS = [
 
 
 # =========================================================
+# SECURITY & PASSWORD HASHING HELPERS
+# =========================================================
+
+SALT_PREFIX = "fitbot_salt_v1"
+
+
+def hash_password(raw_password: str) -> str:
+    digest = hashlib.sha256(f"{SALT_PREFIX}:{raw_password.strip()}".encode("utf-8")).hexdigest()
+    return f"{SALT_PREFIX}${digest}"
+
+
+def verify_password(raw_password: str, stored_hash: str | None) -> bool:
+    if not stored_hash:
+        return False
+    return secrets.compare_digest(hash_password(raw_password), stored_hash)
+
+
+def generate_secure_member_password(gym_name: str) -> str:
+    city_code = "MUM" if "mumbai" in gym_name.lower() else "PUN"
+    rand_digits = secrets.randbelow(9000) + 1000
+    rand_letters = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(2))
+    return f"FIT-{rand_digits}-{city_code}{rand_letters}"
+
+
+# =========================================================
 # SESSION STATE & VECTOR INDEX INITIALIZATION
 # =========================================================
+
+if "auth_user" not in st.session_state:
+    st.session_state["auth_user"] = None
+
+if "failed_attempts" not in st.session_state:
+    st.session_state["failed_attempts"] = 0
+
+if "lockout_until" not in st.session_state:
+    st.session_state["lockout_until"] = 0.0
 
 if "selected_category" not in st.session_state:
     st.session_state["selected_category"] = None
@@ -86,12 +124,18 @@ if "workout_request" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
+if "current_session_id" not in st.session_state:
+    st.session_state["current_session_id"] = None
+
+if "latest_ics" not in st.session_state:
+    st.session_state["latest_ics"] = None
+
 if "chat_open" not in st.session_state:
     st.session_state["chat_open"] = False
 
 if "active_gym" not in st.session_state:
     st.session_state["active_gym"] = {
-        "name": "FitZone Fitness Club",
+        "name": "FitZone Pune",
         "city": "Pune",
         "timings": "Mon-Sat: 6:00 AM - 11:00 PM",
         "monthly_fee": "₹1,499/month",
@@ -109,16 +153,77 @@ if "rag_embeddings" not in st.session_state:
 
 
 # =========================================================
-# HELPER — FETCH BOOKINGS FROM SUPABASE
+# SUPABASE HELPERS (AUTH, BOOKINGS, REMINDERS & CHATS)
 # =========================================================
 
-def fetch_gym_bookings(gym_name: str) -> list[dict]:
+def get_member_record(member_id: str) -> dict | None:
+    if not supabase:
+        return None
+    try:
+        res = (
+            supabase.table("members")
+            .select("*")
+            .eq("member_id", member_id.strip().upper())
+            .execute()
+        )
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_gym_by_name(gym_name: str) -> dict:
+    fallback = {
+        "name": gym_name,
+        "city": "Mumbai" if "mumbai" in gym_name.lower() else "Pune",
+        "timings": "Mon-Sat: 6:00 AM - 11:00 PM",
+        "monthly_fee": "₹1,499/month",
+    }
+    if not supabase:
+        return fallback
+    try:
+        res = supabase.table("gyms").select("*").eq("name", gym_name).execute()
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    return fallback
+
+
+def fetch_gym_bookings(gym_name: str, member_filter: str | None = None) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        query = supabase.table("bookings").select("*").eq("gym_name", gym_name)
+        if member_filter:
+            query = query.ilike("member_name", f"%{member_filter}%")
+        res = query.order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def fetch_gym_reminders(gym_name: str, member_filter: str | None = None) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        query = supabase.table("gym_reminders").select("*").eq("gym_name", gym_name)
+        if member_filter:
+            query = query.ilike("member_name", f"%{member_filter}%")
+        res = query.order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def fetch_branch_members(gym_name: str) -> list[dict]:
     if not supabase:
         return []
     try:
         res = (
-            supabase.table("bookings")
-            .select("*")
+            supabase.table("members")
+            .select("member_id, full_name, email, phone_last4, role, gym_name, plan_type, is_activated")
             .eq("gym_name", gym_name)
             .order("created_at", desc=True)
             .execute()
@@ -128,93 +233,347 @@ def fetch_gym_bookings(gym_name: str) -> list[dict]:
         return []
 
 
+def create_chat_session(gym_name: str, first_msg: str, owner_tag: str) -> str | None:
+    if not supabase:
+        return None
+    try:
+        short_msg = first_msg[:28] + ("..." if len(first_msg) > 28 else "")
+        title = f"[{owner_tag}] {short_msg}"
+        res = supabase.table("chat_sessions").insert({
+            "gym_name": gym_name,
+            "title": title,
+        }).execute()
+        if res.data:
+            return res.data[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
+def save_chat_message(session_id: str | None, role: str, content: str, trace: dict | None = None):
+    if not supabase or not session_id:
+        return
+    try:
+        supabase.table("chat_messages").insert({
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "trace": trace,
+        }).execute()
+    except Exception:
+        pass
+
+
+def fetch_chat_sessions(gym_name: str, owner_tag: str) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("chat_sessions")
+            .select("*")
+            .eq("gym_name", gym_name)
+            .ilike("title", f"[{owner_tag}]%")
+            .order("created_at", desc=True)
+            .limit(15)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def load_session_messages(session_id: str) -> list[dict]:
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("chat_messages")
+            .select("role, content, trace")
+            .eq("session_id", session_id)
+            .order("id", desc=False)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
 # =========================================================
-# SIDEBAR — MULTI-BRANCH SELECTOR & KNOWLEDGE BASE
+# CALENDAR NOTIFICATION (.ICS) GENERATOR
+# =========================================================
+
+def build_gym_ics(gym_name: str, city: str, date_str: str, time_str: str, focus: str) -> tuple[str, str]:
+    try:
+        dt_start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except Exception:
+        dt_start = datetime.now() + timedelta(days=1)
+        dt_start = dt_start.replace(hour=7, minute=0, second=0, microsecond=0)
+
+    dt_end = dt_start + timedelta(hours=1)
+    fmt = "%Y%m%dT%H%M%S"
+
+    ics_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//FitBot AI//Gym Reminder//EN
+BEGIN:VEVENT
+SUMMARY:🏋️ Gym Session: {focus} ({gym_name})
+DTSTART:{dt_start.strftime(fmt)}
+DTEND:{dt_end.strftime(fmt)}
+LOCATION:{gym_name}, {city}
+DESCRIPTION:Time to hit the gym! Scheduled via FitBot AI.
+BEGIN:VALARM
+TRIGGER:-PT30M
+ACTION:DISPLAY
+DESCRIPTION:Gym Workout starts in 30 minutes at {gym_name}!
+END:VALARM
+END:VEVENT
+END:VCALENDAR"""
+
+    gcal_params = urllib.parse.urlencode({
+        "action": "TEMPLATE",
+        "text": f"🏋️ Gym Session: {focus} ({gym_name})",
+        "dates": f"{dt_start.strftime(fmt)}/{dt_end.strftime(fmt)}",
+        "details": "Time to hit the gym! Scheduled via FitBot AI.",
+        "location": f"{gym_name}, {city}",
+    })
+    gcal_url = f"https://calendar.google.com/calendar/render?{gcal_params}"
+    return ics_content, gcal_url
+
+
+# =========================================================
+# AUTHENTICATION GATE (LOGIN + SELF-SERVICE ID ACTIVATION)
+# =========================================================
+
+if st.session_state["auth_user"] is None:
+    show_header()
+
+    now_ts = time.time()
+    if now_ts < st.session_state["lockout_until"]:
+        wait_sec = int(st.session_state["lockout_until"] - now_ts)
+        st.error(f"🔒 Too many failed attempts. Please wait **{wait_sec} seconds** before trying again.")
+        st.stop()
+
+    login_tab, activate_tab = st.tabs(["🔑 Member & Owner Login", "🆕 First-Time ID Activation"])
+
+    # -----------------------------------------------------
+    # TAB 1: RETURNING MEMBER / OWNER LOGIN
+    # -----------------------------------------------------
+    with login_tab:
+        st.markdown("Enter your issued **Member ID** (or **Owner ID**) and password to access your branch.")
+        with st.form("member_login_form"):
+            in_id = st.text_input("Member / Owner ID", placeholder="e.g., OWN-BHOOMI or FZ-PUN-1001")
+            in_pass = st.text_input("Password", type="password", placeholder="Enter your password")
+            submit_login = st.form_submit_button("ENTER CLUB PORTAL →", use_container_width=True)
+
+        if submit_login:
+            record = get_member_record(in_id)
+            if not record:
+                st.session_state["failed_attempts"] += 1
+                st.error("❌ Invalid Member ID. Please check the ID issued by your gym.")
+            elif not record.get("is_activated"):
+                st.warning(
+                    "⚠️ This Member ID has not been activated yet. "
+                    "Switch to the **🆕 First-Time ID Activation** tab to verify your details and generate your password!"
+                )
+            elif not verify_password(in_pass, record.get("password_hash")):
+                st.session_state["failed_attempts"] += 1
+                if st.session_state["failed_attempts"] >= 5:
+                    st.session_state["lockout_until"] = time.time() + 60
+                    st.session_state["failed_attempts"] = 0
+                st.error("❌ Incorrect password.")
+            else:
+                st.session_state["failed_attempts"] = 0
+                st.session_state["auth_user"] = record
+                st.session_state["active_gym"] = fetch_gym_by_name(record["gym_name"])
+                st.session_state["messages"] = []
+                st.session_state["current_session_id"] = None
+                st.rerun()
+
+        with st.expander("🧪 Presentation / Demo Credentials"):
+            st.markdown(
+                "- **Gym Owner (Mumbai + Pune Access):** ID `OWN-BHOOMI` | Password `OWNER123`\n"
+                "- **Unactivated Pune Member:** ID `FZ-PUN-1001` | Name `Rohan Kulkarni` | Email `rohan@gmail.com` | Last 4 digits `3210`\n"
+                "- **Unactivated Mumbai Member:** ID `FZ-MUM-2001` | Name `Ananya Deshmukh` | Email `ananya@gmail.com` | Last 4 digits `2345`"
+            )
+
+    # -----------------------------------------------------
+    # TAB 2: ONE-TIME SELF-SERVICE ID ACTIVATION
+    # -----------------------------------------------------
+    with activate_tab:
+        st.markdown(
+            "Received a Member ID from the front desk? Verify your enrollment details below "
+            "to generate your personal login password."
+        )
+        with st.form("activate_id_form"):
+            act_id = st.text_input("Issued Member ID", placeholder="e.g., FZ-PUN-1001")
+            act_name = st.text_input("Full Name (as registered)", placeholder="e.g., Rohan Kulkarni")
+            act_email = st.text_input("Registered Email ID", placeholder="e.g., rohan@gmail.com")
+            act_phone4 = st.text_input("Last 4 Digits of Registered Phone", max_chars=4, placeholder="e.g., 3210")
+            submit_activate = st.form_submit_button("VERIFY & GENERATE PASSWORD →", use_container_width=True)
+
+        if submit_activate:
+            record = get_member_record(act_id)
+            if not record:
+                st.error("❌ Member ID not found in our gym records.")
+            elif record.get("is_activated"):
+                st.error(
+                    "🔒 **Security Lock:** This Member ID has already been activated. "
+                    "Please log in using your generated password or contact the front desk for a reset."
+                )
+            else:
+                name_ok = act_name.strip().lower() == record["full_name"].strip().lower()
+                email_ok = act_email.strip().lower() == record["email"].strip().lower()
+                phone_ok = act_phone4.strip() == str(record["phone_last4"]).strip()
+
+                if name_ok and email_ok and phone_ok:
+                    new_plain_pass = generate_secure_member_password(record["gym_name"])
+                    new_hash = hash_password(new_plain_pass)
+                    try:
+                        supabase.table("members").update({
+                            "password_hash": new_hash,
+                            "is_activated": True,
+                        }).eq("member_id", record["member_id"]).execute()
+
+                        st.success("✅ **Identity Verified! Your account is now active.**")
+                        st.info(
+                            f"**Save your login credentials now (shown once):**\n\n"
+                            f"- **Member ID:** `{record['member_id']}`\n"
+                            f"- **Generated Password:** `{new_plain_pass}`\n"
+                            f"- **Assigned Branch:** {record['gym_name']} ({record['plan_type']})\n\n"
+                            f"Switch to the **🔑 Member & Owner Login** tab to enter!"
+                        )
+                    except Exception as e:
+                        st.error(f"Database error during activation: {e}")
+                else:
+                    st.session_state["failed_attempts"] += 1
+                    st.error("❌ Verification details do not match our enrollment records. Please double-check your Name, Email, and Phone digits.")
+
+    st.stop()
+
+
+# =========================================================
+# AUTHENTICATED PORTAL (ROLE-BASED ACCESS: OWNER VS MEMBER)
+# =========================================================
+
+current_user = st.session_state["auth_user"]
+is_owner = current_user.get("role") == "owner"
+
+# =========================================================
+# SIDEBAR — ROLE-BASED BRANCH CONTROL & SAVED CHATS
 # =========================================================
 
 with st.sidebar:
-    st.markdown("### 🏢 Fitness Club Portal")
-    st.caption("Select an active branch or onboard a new location.")
+    role_badge = "👑 OWNER ADMIN" if is_owner else "🏋️ VERIFIED MEMBER"
+    st.markdown(f"### {role_badge}")
+    st.caption(f"**{current_user['full_name']}** • ID: `{current_user['member_id']}`")
 
-    gyms_list = [st.session_state["active_gym"]]
-    if supabase:
-        try:
-            res = supabase.table("gyms").select("*").order("created_at").execute()
-            if res.data:
-                gyms_list = res.data
-        except Exception:
-            pass
+    if st.button("🚪 Log Out", use_container_width=True):
+        st.session_state["auth_user"] = None
+        st.session_state["messages"] = []
+        st.session_state["current_session_id"] = None
+        st.session_state["selected_category"] = None
+        st.session_state["chat_open"] = False
+        st.rerun()
 
-    gym_names = [g["name"] for g in gyms_list]
-    current_name = st.session_state["active_gym"]["name"]
-    default_idx = gym_names.index(current_name) if current_name in gym_names else 0
+    st.divider()
 
-    chosen_gym_name = st.selectbox("Active Branch", gym_names, index=default_idx)
-    for g in gyms_list:
-        if g["name"] == chosen_gym_name:
-            st.session_state["active_gym"] = g
-            break
+    # OWNER CAN SWITCH BETWEEN MUMBAI & PUNE; MEMBER IS LOCKED TO HOME BRANCH
+    if is_owner:
+        st.markdown("### 🏢 Multi-Branch Switcher")
+        gyms_list = [st.session_state["active_gym"]]
+        if supabase:
+            try:
+                res = supabase.table("gyms").select("*").order("created_at").execute()
+                if res.data:
+                    gyms_list = res.data
+            except Exception:
+                pass
+
+        gym_names = [g["name"] for g in gyms_list]
+        current_name = st.session_state["active_gym"]["name"]
+        default_idx = gym_names.index(current_name) if current_name in gym_names else 0
+
+        chosen_gym_name = st.selectbox("Select Branch (Owner Access)", gym_names, index=default_idx)
+        for g in gyms_list:
+            if g["name"] == chosen_gym_name:
+                st.session_state["active_gym"] = g
+                break
+    else:
+        st.markdown("### 🏢 Your Home Branch")
+        st.session_state["active_gym"] = fetch_gym_by_name(current_user["gym_name"])
 
     active_gym = st.session_state["active_gym"]
     st.info(
         f"**{active_gym['name']}** — {active_gym['city']}\n\n"
         f"🕒 {active_gym['timings']}\n\n"
-        f"💳 Starting at {active_gym['monthly_fee']}"
+        f"💳 {active_gym['monthly_fee']}"
     )
 
-    with st.expander("➕ Onboard New Branch"):
-        new_gym_name = st.text_input("Club Name", placeholder="e.g., Gold's Gym Koregaon Park")
-        new_gym_city = st.text_input("City", placeholder="e.g., Pune")
-        new_gym_timings = st.text_input("Operating Hours", value="Mon-Sat: 6:00 AM - 10:00 PM")
-        new_gym_fee = st.text_input("Base Membership", value="₹1,999/month")
+    if is_owner:
+        with st.expander("➕ Onboard New Branch"):
+            new_gym_name = st.text_input("Club Name", placeholder="e.g., FitZone Nashik")
+            new_gym_city = st.text_input("City", placeholder="e.g., Nashik")
+            new_gym_timings = st.text_input("Operating Hours", value="Mon-Sat: 6:00 AM - 10:00 PM")
+            new_gym_fee = st.text_input("Base Membership", value="₹1,799/month")
 
-        if st.button("SAVE BRANCH", use_container_width=True):
-            if new_gym_name.strip() and new_gym_city.strip():
-                new_record = {
-                    "name": new_gym_name.strip(),
-                    "city": new_gym_city.strip(),
-                    "timings": new_gym_timings.strip(),
-                    "monthly_fee": new_gym_fee.strip(),
-                }
-                if supabase:
+            if st.button("SAVE BRANCH", use_container_width=True):
+                if new_gym_name.strip() and new_gym_city.strip() and supabase:
+                    new_record = {
+                        "name": new_gym_name.strip(),
+                        "city": new_gym_city.strip(),
+                        "timings": new_gym_timings.strip(),
+                        "monthly_fee": new_gym_fee.strip(),
+                    }
                     try:
                         supabase.table("gyms").insert(new_record).execute()
                         st.session_state["active_gym"] = new_record
-                        st.success(f"{new_gym_name} added successfully!")
+                        st.success(f"{new_gym_name} added!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not save branch: {e}")
-                else:
-                    st.warning("Configure Supabase credentials to persist branches.")
 
     st.divider()
-    st.markdown("### 📚 Policy & Knowledge Store")
-    st.caption(f"Active documents indexed: **{len(st.session_state['rag_docs'])}**")
+    st.markdown("### 💬 Your Saved Chats")
+    if st.button("➕ New Chat", use_container_width=True):
+        st.session_state["messages"] = []
+        st.session_state["current_session_id"] = None
+        st.session_state["latest_ics"] = None
+        st.session_state["chat_open"] = True
+        st.rerun()
 
-    uploaded_doc = st.file_uploader("Upload Branch Policy (.txt / .md)", type=["txt", "md"])
-    if uploaded_doc is not None:
-        doc_text = uploaded_doc.read().decode("utf-8").strip()
-        if doc_text and not any(d["title"] == uploaded_doc.name for d in st.session_state["rag_docs"]):
-            new_doc = {"title": uploaded_doc.name, "content": doc_text}
-            st.session_state["rag_docs"].append(new_doc)
-            if api_key:
-                new_emb = embed_texts(client, [f"{new_doc['title']}: {new_doc['content']}"])[0]
-                st.session_state["rag_embeddings"].append(new_emb)
-            st.success(f"'{uploaded_doc.name}' indexed and live!")
-
-    st.divider()
-    if supabase:
-        st.success("🟢 Cloud Database Connected")
+    saved_sessions = fetch_chat_sessions(active_gym["name"], current_user["member_id"])
+    if saved_sessions:
+        for sess in saved_sessions:
+            display_title = sess["title"].replace(f"[{current_user['member_id']}] ", "")
+            if st.button(f"🗨️ {display_title}", key=f"sess_{sess['id']}", use_container_width=True):
+                st.session_state["current_session_id"] = sess["id"]
+                st.session_state["messages"] = load_session_messages(sess["id"])
+                st.session_state["chat_open"] = True
+                st.rerun()
     else:
-        st.warning("🟡 Cloud Database Offline")
+        st.caption("No saved chats yet.")
+
+    if is_owner:
+        st.divider()
+        st.markdown("### 📚 Branch RAG Policies")
+        st.caption(f"Indexed docs: **{len(st.session_state['rag_docs'])}**")
+        uploaded_doc = st.file_uploader("Upload Policy (.txt / .md)", type=["txt", "md"])
+        if uploaded_doc is not None:
+            doc_text = uploaded_doc.read().decode("utf-8").strip()
+            if doc_text and not any(d["title"] == uploaded_doc.name for d in st.session_state["rag_docs"]):
+                new_doc = {"title": uploaded_doc.name, "content": doc_text}
+                st.session_state["rag_docs"].append(new_doc)
+                if api_key:
+                    new_emb = embed_texts(client, [f"{new_doc['title']}: {new_doc['content']}"])[0]
+                    st.session_state["rag_embeddings"].append(new_emb)
+                st.success(f"'{uploaded_doc.name}' indexed!")
 
 
 # =========================================================
-# AGENTIC TOOLS (MACRO CALCULATOR + SUPABASE BOOKING)
+# AGENTIC TOOLS (PERSONALIZED TO LOGGED-IN USER)
 # =========================================================
 
 def calculate_macros(weight_kg: float, goal: str) -> str:
-    """Calculates daily calories and macronutrients based on weight in kg and fitness goal."""
     st.session_state["last_tool_used"] = f"calculate_macros(weight_kg={weight_kg}, goal='{goal}')"
     if "loss" in goal.lower():
         calories = weight_kg * 22
@@ -229,12 +588,13 @@ def calculate_macros(weight_kg: float, goal: str) -> str:
 def book_trainer_session(
     trainer_name: str,
     time_slot: str,
-    member_name: str = "Walk-in Member",
-    member_phone: str = "Not Provided"
+    member_name: str = "",
+    member_phone: str = "On File"
 ) -> str:
-    """Books a personal training session and saves it to the gym's Supabase database."""
+    # Automatically use logged-in member's verified name & ID
+    verified_name = f"{current_user['full_name']} ({current_user['member_id']})"
     st.session_state["last_tool_used"] = (
-        f"book_trainer_session(trainer='{trainer_name}', slot='{time_slot}', member='{member_name}')"
+        f"book_trainer_session(trainer='{trainer_name}', slot='{time_slot}', member='{verified_name}')"
     )
     gym_name = st.session_state["active_gym"]["name"]
 
@@ -242,19 +602,60 @@ def book_trainer_session(
         try:
             supabase.table("bookings").insert({
                 "gym_name": gym_name,
-                "member_name": member_name,
+                "member_name": verified_name,
                 "member_phone": member_phone,
                 "trainer_name": trainer_name,
                 "time_slot": time_slot,
             }).execute()
             return (
-                f"Booking confirmed for {member_name} with {trainer_name} at {time_slot} "
+                f"Booking confirmed for {verified_name} with {trainer_name} at {time_slot} "
                 f"({gym_name})."
             )
         except Exception as e:
             return f"Unable to complete booking: {str(e)}"
 
-    return f"Booking confirmed for {member_name} with {trainer_name} at {time_slot}."
+    return f"Booking confirmed for {verified_name} with {trainer_name} at {time_slot}."
+
+
+def set_gym_reminder(
+    reminder_date: str,
+    reminder_time: str,
+    workout_focus: str = "Gym Workout Session",
+    member_name: str = ""
+) -> str:
+    verified_name = f"{current_user['full_name']} ({current_user['member_id']})"
+    st.session_state["last_tool_used"] = (
+        f"set_gym_reminder(date='{reminder_date}', time='{reminder_time}', focus='{workout_focus}')"
+    )
+    gym = st.session_state["active_gym"]
+    ics_data, gcal_url = build_gym_ics(
+        gym_name=gym["name"],
+        city=gym["city"],
+        date_str=reminder_date,
+        time_str=reminder_time,
+        focus=workout_focus,
+    )
+    st.session_state["latest_ics"] = {
+        "ics": ics_data,
+        "gcal": gcal_url,
+        "label": f"{workout_focus} — {reminder_date} at {reminder_time}",
+    }
+
+    if supabase:
+        try:
+            supabase.table("gym_reminders").insert({
+                "gym_name": gym["name"],
+                "member_name": verified_name,
+                "workout_focus": workout_focus,
+                "reminder_date": reminder_date,
+                "reminder_time": reminder_time,
+            }).execute()
+        except Exception:
+            pass
+
+    return (
+        f"Gym reminder set for {verified_name} on {reminder_date} at {reminder_time} ({workout_focus}) at {gym['name']}."
+    )
 
 
 # =========================================================
@@ -288,7 +689,7 @@ def call_gemini(prompt: str) -> str:
 
 
 # =========================================================
-# AGENTIC WORKFLOW — LANGGRAPH STATEGRAPH EXECUTION
+# AGENTIC WORKFLOW — STATEGRAPH EXECUTION
 # =========================================================
 
 def generate_fitbot_response() -> tuple[str, dict]:
@@ -296,7 +697,10 @@ def generate_fitbot_response() -> tuple[str, dict]:
     st.session_state["last_tool_used"] = None
 
     latest_user_query = ""
-    conversation_history = ""
+    conversation_history = (
+        f"SYSTEM CONTEXT: Logged-in user is {current_user['full_name']} "
+        f"(ID: {current_user['member_id']}, Role: {current_user['role']}).\n\n"
+    )
 
     for message in st.session_state["messages"]:
         role = "USER" if message["role"] == "user" else "FITBOT"
@@ -309,6 +713,7 @@ def generate_fitbot_response() -> tuple[str, dict]:
         models=MODELS,
         calc_macros_fn=calculate_macros,
         book_trainer_fn=book_trainer_session,
+        set_reminder_fn=set_gym_reminder,
     )
 
     final_state = graph.invoke({
@@ -348,10 +753,10 @@ if st.session_state["chat_open"]:
             st.rerun()
 
     with end_col:
-        if st.button("CLEAR CHAT", key="end_conversation", use_container_width=True):
+        if st.button("➕ NEW CHAT", key="end_conversation", use_container_width=True):
             st.session_state["messages"] = []
-            st.session_state["chat_open"] = False
-            st.session_state["selected_category"] = None
+            st.session_state["current_session_id"] = None
+            st.session_state["latest_ics"] = None
             st.rerun()
 
     st.markdown(
@@ -362,7 +767,7 @@ if st.session_state["chat_open"]:
         f'</div>'
         f'<div class="chat-page-divider"></div>'
         f'<div class="chat-page-subtitle">'
-        f'{st.session_state["active_gym"]["name"].upper()} • MEMBER CONCIERGE'
+        f'{st.session_state["active_gym"]["name"].upper()} • {current_user["full_name"].upper()}'
         f'</div>'
         f'</div>',
         unsafe_allow_html=True
@@ -401,11 +806,43 @@ if st.session_state["chat_open"]:
             "content": assistant_reply,
             "trace": trace,
         })
+        save_chat_message(
+            st.session_state.get("current_session_id"),
+            "assistant",
+            assistant_reply,
+            trace,
+        )
 
-    user_message = st.chat_input("Ask about memberships, calculate macros, or book a trainer...")
+    if st.session_state.get("latest_ics"):
+        rem = st.session_state["latest_ics"]
+        st.info(f"🔔 **Workout Reminder Ready:** {rem['label']}")
+        r_col1, r_col2 = st.columns(2)
+        with r_col1:
+            st.download_button(
+                "📲 ADD PHONE ALERT (.ICS)",
+                data=rem["ics"],
+                file_name="fitbot_gym_reminder.ics",
+                mime="text/calendar",
+                use_container_width=True,
+            )
+        with r_col2:
+            st.link_button(
+                "📅 OPEN GOOGLE CALENDAR",
+                url=rem["gcal"],
+                use_container_width=True,
+            )
+
+    user_message = st.chat_input("Ask about memberships, set a gym reminder, or book a trainer...")
 
     if user_message:
+        if not st.session_state.get("current_session_id"):
+            st.session_state["current_session_id"] = create_chat_session(
+                st.session_state["active_gym"]["name"],
+                user_message,
+                current_user["member_id"],
+            )
         st.session_state["messages"].append({"role": "user", "content": user_message})
+        save_chat_message(st.session_state["current_session_id"], "user", user_message)
         st.rerun()
 
 
@@ -423,12 +860,14 @@ else:
         show_header()
 
         active_gym = st.session_state["active_gym"]
-        branch_bookings = fetch_gym_bookings(active_gym["name"])
+        member_filter = None if is_owner else current_user["member_id"]
+        branch_bookings = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
+        branch_reminders = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Active Branch", active_gym["city"], active_gym["name"])
-        m2.metric("Standard Plan", active_gym["monthly_fee"], "Full Floor Access")
-        m3.metric("PT Bookings", f"{len(branch_bookings)}", "Live Synced")
+        m2.metric("PT Bookings", f"{len(branch_bookings)}", "Branch Total" if is_owner else "Your Sessions")
+        m3.metric("Reminders", f"{len(branch_reminders)}", "Scheduled")
 
         st.write("")
         workout, activities, trainers, gym_info = show_categories()
@@ -449,23 +888,45 @@ else:
             st.session_state["selected_category"] = "gym_info"
             st.rerun()
 
-        b_space1, b_col1, b_col2, b_space2 = st.columns([0.6, 2, 2, 0.6], gap="medium")
-        with b_col1:
-            if st.button("📊 BMI & MACROS", key="open_calculator", use_container_width=True):
-                st.session_state["selected_category"] = "calculator"
-                st.rerun()
-
-        with b_col2:
-            if st.button("📋 BOOKINGS & DESK", key="open_bookings", use_container_width=True):
-                st.session_state["selected_category"] = "bookings"
-                st.rerun()
+        if is_owner:
+            b1, b2, b3, b4 = st.columns(4, gap="small")
+            with b1:
+                if st.button("📊 MACROS", key="open_calculator", use_container_width=True):
+                    st.session_state["selected_category"] = "calculator"
+                    st.rerun()
+            with b2:
+                if st.button("📋 BOOKINGS", key="open_bookings", use_container_width=True):
+                    st.session_state["selected_category"] = "bookings"
+                    st.rerun()
+            with b3:
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                    st.session_state["selected_category"] = "reminders"
+                    st.rerun()
+            with b4:
+                if st.button("🪪 MEMBERS", key="open_members", use_container_width=True):
+                    st.session_state["selected_category"] = "members_admin"
+                    st.rerun()
+        else:
+            b1, b2, b3 = st.columns(3, gap="small")
+            with b1:
+                if st.button("📊 BMI & MACROS", key="open_calculator", use_container_width=True):
+                    st.session_state["selected_category"] = "calculator"
+                    st.rerun()
+            with b2:
+                if st.button("📋 MY BOOKINGS", key="open_bookings", use_container_width=True):
+                    st.session_state["selected_category"] = "bookings"
+                    st.rerun()
+            with b3:
+                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                    st.session_state["selected_category"] = "reminders"
+                    st.rerun()
 
         st.divider()
 
         st.markdown(
-            """
+            f"""
 <div class="fitbot-cta">
-    HOW CAN <span>I</span> HELP YOU?
+    HOW CAN <span>I</span> HELP YOU, {current_user['full_name'].split()[0].upper()}?
 </div>
 """,
             unsafe_allow_html=True
@@ -474,16 +935,166 @@ else:
         with st.form("home_chat_form", clear_on_submit=True):
             first_message = st.text_input(
                 "Ask FitBot",
-                placeholder="Ask about memberships, freeze policy, nutrition, or book a trainer...",
+                placeholder="Ask about memberships, book a trainer, or set a gym reminder...",
                 label_visibility="collapsed"
             )
 
             send_message = st.form_submit_button("START CHAT →", use_container_width=True)
 
         if send_message and first_message.strip():
-            st.session_state["messages"] = [{"role": "user", "content": first_message.strip()}]
+            clean_msg = first_message.strip()
+            sess_id = create_chat_session(
+                st.session_state["active_gym"]["name"],
+                clean_msg,
+                current_user["member_id"],
+            )
+            st.session_state["current_session_id"] = sess_id
+            st.session_state["messages"] = [{"role": "user", "content": clean_msg}]
+            save_chat_message(sess_id, "user", clean_msg)
             st.session_state["chat_open"] = True
             st.rerun()
+
+    # =====================================================
+    # OWNER ONLY: ISSUE MEMBER IDs & MANAGE ROSTER
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "members_admin" and is_owner:
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">MEMBER</span> '
+            '<span style="color:#B7F34A !important;">ENROLLMENT</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            f'<p class="general-page-subtitle">'
+            f'Issue new Member IDs for {active_gym["name"]}. Members activate their own password on first login.'
+            f'</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_members"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        city_prefix = "MUM" if "mumbai" in active_gym["name"].lower() else "PUN"
+        suggested_id = f"FZ-{city_prefix}-{secrets.randbelow(8999) + 1000}"
+
+        with st.form("issue_member_id_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                new_m_id = st.text_input("New Member ID", value=suggested_id)
+                new_m_name = st.text_input("Member Full Name", placeholder="e.g., Siddharth Joshi")
+            with c2:
+                new_m_email = st.text_input("Member Email ID", placeholder="e.g., siddharth@gmail.com")
+                new_m_phone4 = st.text_input("Last 4 Digits of Phone", max_chars=4, placeholder="e.g., 7890")
+            new_m_plan = st.selectbox("Membership Plan", ["Monthly", "Quarterly Pro", "Annual Elite"])
+
+            if st.form_submit_button("🪪 ISSUE MEMBER ID", use_container_width=True):
+                if new_m_id.strip() and new_m_name.strip() and new_m_email.strip() and len(new_m_phone4.strip()) == 4 and supabase:
+                    try:
+                        supabase.table("members").insert({
+                            "member_id": new_m_id.strip().upper(),
+                            "full_name": new_m_name.strip(),
+                            "email": new_m_email.strip().lower(),
+                            "phone_last4": new_m_phone4.strip(),
+                            "password_hash": None,
+                            "is_activated": False,
+                            "role": "member",
+                            "gym_name": active_gym["name"],
+                            "plan_type": new_m_plan,
+                        }).execute()
+                        st.success(
+                            f"✅ Issued ID **`{new_m_id.strip().upper()}`** to **{new_m_name.strip()}** ({active_gym['name']}). "
+                            f"They can now activate their password on the login screen!"
+                        )
+                    except Exception as e:
+                        st.error(f"Could not create member: {e}")
+                else:
+                    st.warning("Please fill in all fields including 4 phone digits.")
+
+        st.subheader(f"Enrolled Roster — {active_gym['name']}")
+        roster = fetch_branch_members(active_gym["name"])
+        if roster:
+            st.dataframe(pd.DataFrame(roster), use_container_width=True, hide_index=True)
+        else:
+            st.info("No members enrolled in this branch yet.")
+
+    # =====================================================
+    # GYM REMINDERS & NOTIFICATION CENTER
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "reminders":
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">GYM</span> '
+            '<span style="color:#B7F34A !important;">REMINDERS</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Schedule workout alerts and sync 30-minute notifications directly to your phone calendar.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_reminders"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        with st.form("schedule_reminder_form", clear_on_submit=True):
+            r1, r2 = st.columns(2)
+            with r1:
+                rem_date = st.date_input("Workout Date", value=datetime.now().date() + timedelta(days=1))
+                rem_time = st.time_input("Workout Time", value=datetime.strptime("07:00", "%H:%M").time())
+            with r2:
+                rem_focus = st.selectbox(
+                    "Workout Focus",
+                    ["Full Body Strength", "Upper Body & Core", "Leg Day", "Cardio & HIIT", "Yoga / Mobility"]
+                )
+
+            if st.form_submit_button("🔔 SET GYM REMINDER", use_container_width=True):
+                d_str = rem_date.strftime("%Y-%m-%d")
+                t_str = rem_time.strftime("%H:%M")
+                msg = set_gym_reminder(
+                    reminder_date=d_str,
+                    reminder_time=t_str,
+                    workout_focus=rem_focus,
+                )
+                st.success(msg)
+
+        if st.session_state.get("latest_ics"):
+            rem = st.session_state["latest_ics"]
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "📲 DOWNLOAD PHONE NOTIFICATION (.ICS)",
+                    data=rem["ics"],
+                    file_name="fitbot_gym_reminder.ics",
+                    mime="text/calendar",
+                    use_container_width=True,
+                )
+            with c2:
+                st.link_button(
+                    "📅 SYNC WITH GOOGLE CALENDAR",
+                    url=rem["gcal"],
+                    use_container_width=True,
+                )
+
+        st.subheader("Scheduled Workout Reminders")
+        member_filter = None if is_owner else current_user["member_id"]
+        reminders_list = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
+        if reminders_list:
+            df_rem = pd.DataFrame(reminders_list)
+            cols = [c for c in ["member_name", "workout_focus", "reminder_date", "reminder_time"] if c in df_rem.columns]
+            st.dataframe(df_rem[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("No reminders scheduled yet.")
 
     # =====================================================
     # BOOKINGS & FRONT-DESK OPERATIONS
@@ -496,11 +1107,11 @@ else:
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
             '<span style="color:#F5F5F5 !important;">BOOKINGS &</span> '
-            '<span style="color:#B7F34A !important;">FRONT DESK</span>'
+            '<span style="color:#B7F34A !important;">SCHEDULE</span>'
             '</h1>'
             '<div class="general-page-divider"></div>'
             f'<p class="general-page-subtitle">'
-            f'Live personal training schedule and walk-in booking desk for {active_gym["name"]}.'
+            f'Personal training sessions for {active_gym["name"]}.'
             f'</p>'
             '</div>',
             unsafe_allow_html=True
@@ -510,62 +1121,57 @@ else:
             st.session_state["selected_category"] = None
             st.rerun()
 
-        bookings_data = fetch_gym_bookings(active_gym["name"])
+        member_filter = None if is_owner else current_user["member_id"]
+        bookings_data = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
 
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total Sessions", len(bookings_data))
-        k2.metric("Active Trainers", "3")
-        k3.metric("Branch", active_gym["city"])
+        if is_owner:
+            with st.expander("➕ Log Walk-In / Phone Booking", expanded=False):
+                with st.form("walkin_booking_form", clear_on_submit=True):
+                    wb_col1, wb_col2 = st.columns(2)
+                    with wb_col1:
+                        wb_member = st.text_input("Member Name & ID", placeholder="e.g., Rohan Kulkarni (FZ-PUN-1001)")
+                        wb_phone = st.text_input("Phone Number", placeholder="e.g., +91-98765-43210")
+                    with wb_col2:
+                        wb_trainer = st.selectbox("Trainer", ["Rahul Sharma", "Priya Mehta", "Arjun Patel"])
+                        wb_slot = st.text_input("Date & Time Slot", placeholder="e.g., Tomorrow 8:00 AM")
 
-        with st.expander("➕ Log Walk-In / Phone Booking", expanded=False):
-            with st.form("walkin_booking_form", clear_on_submit=True):
-                wb_col1, wb_col2 = st.columns(2)
-                with wb_col1:
-                    wb_member = st.text_input("Member Name", placeholder="e.g., Rohan Kulkarni")
-                    wb_phone = st.text_input("Phone Number", placeholder="e.g., +91-98765-43210")
-                with wb_col2:
-                    wb_trainer = st.selectbox("Trainer", ["Rahul Sharma", "Priya Mehta", "Arjun Patel"])
-                    wb_slot = st.text_input("Date & Time Slot", placeholder="e.g., Tomorrow 8:00 AM")
-
-                if st.form_submit_button("CONFIRM BOOKING", use_container_width=True):
-                    if wb_member.strip() and wb_slot.strip() and supabase:
-                        try:
-                            supabase.table("bookings").insert({
-                                "gym_name": active_gym["name"],
-                                "member_name": wb_member.strip(),
-                                "member_phone": wb_phone.strip() or "Not Provided",
-                                "trainer_name": wb_trainer,
-                                "time_slot": wb_slot.strip(),
-                            }).execute()
-                            st.success("Walk-in booking recorded!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Database error: {e}")
+                    if st.form_submit_button("CONFIRM BOOKING", use_container_width=True):
+                        if wb_member.strip() and wb_slot.strip() and supabase:
+                            try:
+                                supabase.table("bookings").insert({
+                                    "gym_name": active_gym["name"],
+                                    "member_name": wb_member.strip(),
+                                    "member_phone": wb_phone.strip() or "Not Provided",
+                                    "trainer_name": wb_trainer,
+                                    "time_slot": wb_slot.strip(),
+                                }).execute()
+                                st.success("Walk-in booking recorded!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Database error: {e}")
 
         st.subheader("Scheduled Sessions")
-        if not supabase:
-            st.warning("Connect Supabase credentials to view and manage live bookings.")
-        elif bookings_data:
+        if bookings_data:
             df = pd.DataFrame(bookings_data)
-            display_cols = [c for c in ["member_name", "member_phone", "trainer_name", "time_slot", "created_at"] if c in df.columns]
+            display_cols = [c for c in ["member_name", "trainer_name", "time_slot", "created_at"] if c in df.columns]
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
-            csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ EXPORT SCHEDULE (CSV)",
-                data=csv_bytes,
-                file_name=f"{active_gym['name'].lower().replace(' ', '_')}_bookings.csv",
-                mime="text/csv",
-            )
+            if is_owner:
+                csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ EXPORT BRANCH SCHEDULE (CSV)",
+                    data=csv_bytes,
+                    file_name=f"{active_gym['name'].lower().replace(' ', '_')}_bookings.csv",
+                    mime="text/csv",
+                )
         else:
-            st.info(f"No sessions scheduled yet for **{active_gym['name']}**. Book via chat or use the walk-in form above.")
+            st.info("No sessions scheduled yet. Book a trainer via chat!")
 
     # =====================================================
     # BMI & MACRO CALCULATOR
     # =====================================================
 
     elif st.session_state["selected_category"] == "calculator":
-
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
@@ -625,7 +1231,6 @@ else:
     # =====================================================
 
     elif st.session_state["selected_category"] == "workout":
-
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
@@ -656,7 +1261,7 @@ else:
 
             if st.button("GET WORKOUT PLAN →", key="get_workout_plan", use_container_width=True):
                 st.session_state["workout_request"] = (
-                    f"Create a {workout_level} level workout plan for me. "
+                    f"Create a {workout_level} level workout plan for {current_user['full_name']}. "
                     "Make it clear, structured, practical and suitable for a gym member."
                 )
 
@@ -687,7 +1292,6 @@ else:
     # =====================================================
 
     elif st.session_state["selected_category"] == "activities":
-
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
@@ -743,7 +1347,6 @@ else:
     # =====================================================
 
     elif st.session_state["selected_category"] == "trainers":
-
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
