@@ -1,7 +1,9 @@
 import os
+import time
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 from gym_data import GYM_DATA
 from styles import load_css
@@ -28,13 +30,24 @@ else:
 
 
 # =========================================================
-# GEMINI SETUP
+# GEMINI SETUP (WORKS LOCALLY & ON STREAMLIT CLOUD)
 # =========================================================
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
+if not api_key:
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
+
 client = genai.Client(api_key=api_key)
+
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
+]
 
 
 # =========================================================
@@ -58,6 +71,67 @@ if "chat_open" not in st.session_state:
 
 
 # =========================================================
+# TOOLS
+# =========================================================
+
+def calculate_macros(weight_kg: float, goal: str) -> str:
+    """Calculates daily calories and macronutrients based on weight in kg and fitness goal (e.g., 'weight loss', 'muscle gain')."""
+    if "loss" in goal.lower():
+        calories = weight_kg * 22
+        protein = weight_kg * 2.0
+    else:
+        calories = weight_kg * 30
+        protein = weight_kg * 2.2
+
+    return f"Target Calories: {calories:.0f} kcal, Protein target: {protein:.0f}g."
+
+
+def book_trainer_session(trainer_name: str, time_slot: str) -> str:
+    """Books a personal training session with a specific trainer at a specific time."""
+    return f"Success! Mock session booked with {trainer_name} at {time_slot}."
+
+
+# =========================================================
+# HELPER — CALL GEMINI WITH RETRY & FALLBACK
+# =========================================================
+
+def call_gemini(prompt: str, use_tools: bool = False) -> str:
+    if not api_key:
+        return "API key is missing. Please add GEMINI_API_KEY to your .env file or Streamlit Secrets."
+
+    last_error = ""
+
+    for model_name in MODELS:
+        config_kwargs = {"temperature": 0.4}
+
+        if use_tools:
+            config_kwargs["tools"] = [calculate_macros, book_trainer_session]
+
+        if "3.8" in model_name or "2.5" in model_name:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(**config_kwargs)
+                )
+                return response.text
+
+            except Exception as e:
+                last_error = str(e)
+                if "503" in last_error and attempt == 0:
+                    time.sleep(2)
+                    continue
+                if "503" in last_error or "404" in last_error:
+                    break
+                return f"I'm temporarily unable to respond. Error: {last_error}"
+
+    return f"All Gemini models are currently busy. Please try again in a minute. (Last error: {last_error})"
+
+
+# =========================================================
 # HELPER — GENERATE FITBOT RESPONSE
 # =========================================================
 
@@ -66,16 +140,8 @@ def generate_fitbot_response():
     conversation_history = ""
 
     for message in st.session_state["messages"]:
-
-        role = (
-            "USER"
-            if message["role"] == "user"
-            else "FITBOT"
-        )
-
-        conversation_history += (
-            f"{role}: {message['content']}\n\n"
-        )
+        role = "USER" if message["role"] == "user" else "FITBOT"
+        conversation_history += f"{role}: {message['content']}\n\n"
 
     prompt = f"""
 You are FitBot AI, the virtual gym receptionist and fitness assistant
@@ -88,38 +154,14 @@ CONVERSATION:
 {conversation_history}
 
 INSTRUCTIONS:
-
-- Continue the conversation naturally.
-- Remember information from earlier messages in this conversation.
-- Understand follow-up questions using previous conversation context.
-
+- Continue the conversation naturally and remember earlier messages.
 - For FitZone-specific information, use ONLY the provided GYM INFORMATION.
-- Never invent gym timings, membership prices, trainer details,
-  schedules, facilities, phone numbers or other FitZone information.
-
-- If FitZone-specific information is unavailable, clearly say so.
-
-- You may provide general fitness, exercise and workout guidance.
-- Keep workout advice practical and structured.
-- Do not unnecessarily repeat information already provided.
-- Keep responses friendly, professional and concise.
+- If the user asks for calorie or macro targets based on their weight, use the calculate_macros tool.
+- If the user asks to book a trainer, use the book_trainer_session tool.
+- Keep responses friendly, professional, and concise.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt
-        )
-
-        return response.text
-
-    except Exception:
-
-        return (
-            "I'm temporarily unable to respond. "
-            "Please wait a moment and try again."
-        )
+    return call_gemini(prompt, use_tools=True)
 
 
 # =========================================================
@@ -128,14 +170,9 @@ INSTRUCTIONS:
 
 if st.session_state["chat_open"]:
 
-    # -----------------------------------------------------
-    # Chat navigation
-    # -----------------------------------------------------
-
     back_col, space_col, end_col = st.columns([1.5, 3, 1.7])
 
     with back_col:
-
         if st.button(
             "← BACK TO HOME",
             key="back_from_chat",
@@ -145,7 +182,6 @@ if st.session_state["chat_open"]:
             st.rerun()
 
     with end_col:
-
         if st.button(
             "END CONVERSATION",
             key="end_conversation",
@@ -155,15 +191,6 @@ if st.session_state["chat_open"]:
             st.session_state["chat_open"] = False
             st.session_state["selected_category"] = None
             st.rerun()
-
-
-    # -----------------------------------------------------
-    # Chat heading
-    # -----------------------------------------------------
-
-      # -----------------------------------------------------
-    # Chat heading
-    # -----------------------------------------------------
 
     st.markdown(
         '<div class="chat-page-header">'
@@ -179,57 +206,27 @@ if st.session_state["chat_open"]:
         unsafe_allow_html=True
     )
 
-
-    # -----------------------------------------------------
-    # Conversation
-    # -----------------------------------------------------
-
     for message in st.session_state["messages"]:
-
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-
-    # -----------------------------------------------------
-    # Follow-up input
-    # -----------------------------------------------------
-
-    user_message = st.chat_input(
-        "Ask a follow-up question..."
-    )
-
+    user_message = st.chat_input("Ask a follow-up question...")
 
     if user_message:
-
-        # Save user message
         st.session_state["messages"].append(
-            {
-                "role": "user",
-                "content": user_message
-            }
+            {"role": "user", "content": user_message}
         )
 
-        # Display it
         with st.chat_message("user"):
             st.markdown(user_message)
 
-
-        # Generate response
         with st.chat_message("assistant"):
-
             with st.spinner("FitBot is thinking..."):
-
                 assistant_reply = generate_fitbot_response()
-
             st.markdown(assistant_reply)
 
-
-        # Save assistant response
         st.session_state["messages"].append(
-            {
-                "role": "assistant",
-                "content": assistant_reply
-            }
+            {"role": "assistant", "content": assistant_reply}
         )
 
 
@@ -239,8 +236,6 @@ if st.session_state["chat_open"]:
 
 else:
 
-
-  
     # =====================================================
     # HOME SCREEN
     # =====================================================
@@ -248,11 +243,6 @@ else:
     if st.session_state["selected_category"] is None:
         show_header()
         workout, activities, trainers, gym_info = show_categories()
-
-
-        # ---------------------------------------------
-        # Category navigation
-        # ---------------------------------------------
 
         if workout:
             st.session_state["selected_category"] = "workout"
@@ -270,8 +260,18 @@ else:
             st.session_state["selected_category"] = "gym_info"
             st.rerun()
 
+        # New Feature Button
+        calc_left, calc_center, calc_right = st.columns([1, 2, 1])
+        with calc_center:
+            if st.button(
+                "📊 BMI & MACRO CALCULATOR",
+                key="open_calculator",
+                use_container_width=True
+            ):
+                st.session_state["selected_category"] = "calculator"
+                st.rerun()
 
-               # =================================================
+        # =================================================
         # ASK FITBOT — HOME
         # =================================================
 
@@ -287,7 +287,6 @@ else:
         )
 
         with st.form("home_chat_form", clear_on_submit=True):
-
             first_message = st.text_input(
                 "Ask FitBot",
                 placeholder="Ask about workouts, trainers, activities, gym timings, or fitness...",
@@ -300,30 +299,93 @@ else:
             )
 
         if send_message and first_message.strip():
-
             st.session_state["messages"] = [
-                {
-                    "role": "user",
-                    "content": first_message.strip()
-                }
+                {"role": "user", "content": first_message.strip()}
             ]
-
             st.session_state["chat_open"] = True
             st.rerun()
 
+    # =====================================================
+    # BMI & MACRO CALCULATOR (NEW FEATURE)
+    # =====================================================
 
-        # =====================================================
+    elif st.session_state["selected_category"] == "calculator":
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">BMI & MACRO</span> '
+            '<span style="color:#B7F34A !important;">CALCULATOR</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Calculate your Body Mass Index and daily nutrition targets instantly.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_calculator"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        calc_l, calc_c, calc_r = st.columns([0.8, 3.5, 0.8])
+
+        with calc_c:
+            weight = st.number_input(
+                "Weight (kg)",
+                min_value=30.0,
+                max_value=200.0,
+                value=70.0,
+                step=0.5
+            )
+            height_cm = st.number_input(
+                "Height (cm)",
+                min_value=120.0,
+                max_value=230.0,
+                value=170.0,
+                step=1.0
+            )
+            goal = st.selectbox(
+                "Fitness Goal",
+                ["Weight Loss", "Maintenance", "Muscle Gain"]
+            )
+
+            if st.button("CALCULATE →", key="run_calc", use_container_width=True):
+                height_m = height_cm / 100
+                bmi = weight / (height_m ** 2)
+
+                if bmi < 18.5:
+                    bmi_status = "Underweight"
+                elif bmi < 25:
+                    bmi_status = "Healthy Weight"
+                elif bmi < 30:
+                    bmi_status = "Overweight"
+                else:
+                    bmi_status = "Obese"
+
+                if goal == "Weight Loss":
+                    calories = weight * 22
+                    protein = weight * 2.0
+                elif goal == "Maintenance":
+                    calories = weight * 26
+                    protein = weight * 1.8
+                else:
+                    calories = weight * 30
+                    protein = weight * 2.2
+
+                st.divider()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("BMI", f"{bmi:.1f}", bmi_status)
+                m2.metric("Daily Calories", f"{calories:.0f} kcal")
+                m3.metric("Daily Protein", f"{protein:.0f} g")
+
+    # =====================================================
     # WORKOUT PLANS
     # =====================================================
 
     elif st.session_state["selected_category"] == "workout":
 
-        # -------------------------------------------------
-# PAGE HEADER
-# -------------------------------------------------
-
-        
-  
         st.markdown(
             '<div class="general-page-header">'
             '<h1 class="general-page-title">'
@@ -338,41 +400,17 @@ else:
             unsafe_allow_html=True
         )
 
-        # -------------------------------------------------
-        # BACK LINK
-        # -------------------------------------------------
+        if st.button("← Back", key="back_from_workout"):
+            st.session_state["selected_category"] = None
+            st.session_state["workout_request"] = None
+            st.rerun()
 
-        if st.button(
-        "← Back",
-        key="back_from_workout"
-       ):
-          st.session_state["selected_category"] = None
-          st.session_state["workout_request"] = None
-          st.rerun()
-
-
-        # -------------------------------------------------
-        # FITNESS LEVEL
-        # -------------------------------------------------
-
-                # -------------------------------------------------
-        # WORKOUT FORM
-        # -------------------------------------------------
-
-        form_left, form_center, form_right = st.columns(
-            [1.2, 3, 1.2]
-        )
+        form_left, form_center, form_right = st.columns([1.2, 3, 1.2])
 
         with form_center:
-
             workout_level = st.selectbox(
                 "Choose your fitness level",
-                [
-                    "Beginner",
-                    "Intermediate",
-                    "Advanced",
-                    "Pro"
-                ],
+                ["Beginner", "Intermediate", "Advanced", "Pro"],
                 key="workout_level"
             )
 
@@ -381,538 +419,13 @@ else:
                 key="get_workout_plan",
                 use_container_width=True
             ):
-
                 st.session_state["workout_request"] = (
                     f"Create a {workout_level} level workout plan for me. "
                     "Make it clear, structured, practical and suitable "
                     "for a gym member."
                 )
-        
-
-        # -------------------------------------------------
-        # GENERATED WORKOUT PLAN
-        # -------------------------------------------------
 
         if st.session_state["workout_request"]:
-
-            with st.spinner(
-                "Creating your workout plan..."
-            ):
-
-                try:
-
-                    workout_response = (
-                        client.models.generate_content(
-                            model="gemini-3.6-flash",
-                            contents=st.session_state[
-                                "workout_request"
-                            ]
-                        )
-                    )
-
-
-                    # -----------------------------------------
-                    # RESULT HEADING
-                    # -----------------------------------------
-
-                    st.markdown(
-    '<div class="general-page-header" style="margin-top:40px;">'
-    '<h2 class="general-page-title" style="font-size:30px;">'
-    'YOUR <span>WORKOUT PLAN</span>'
-    '</h2>'
-    '<div class="general-page-divider"></div>'
-    '</div>',
-    unsafe_allow_html=True
-)
-                    
-
-                   # -----------------------------------------
-                   # RESULT
-                   # -----------------------------------------
-                                    # -----------------------------------------
-                    # RESULT
-                    # -----------------------------------------
-
-                    result_left, result_center, result_right = st.columns(
-                        [0.7, 4, 0.7]
-                    )
-
-                    with result_center:
-
-                        st.markdown(
-                            '<div class="workout-result-label">'
-                            'FITBOT GENERATED PLAN'
-                            '</div>',
-                            unsafe_allow_html=True
-                        )
-
-                        st.markdown(
-                            workout_response.text
-                        )
-
-
-                except Exception:
-
-                    st.warning(
-                        "FitBot is temporarily unable to "
-                        "generate your workout plan. "
-                        "Please try again shortly."
-                    )
-
-
-            # ---------------------------------------------
-            # RESET REQUEST
-            # ---------------------------------------------
-
-            st.session_state["workout_request"] = None
-
-        
-
-    # =====================================================
-    # ACTIVITIES
-    # =====================================================
-
-    
-    # =====================================================
-    # ACTIVITIES
-    # =====================================================
-
-    elif st.session_state["selected_category"] == "activities":
-
-        # -------------------------------------------------
-        # PAGE HEADER
-        # -------------------------------------------------
-
-        st.markdown(
-            '<div class="general-page-header">'
-            '<h1 class="general-page-title">'
-            '<span style="color:#F5F5F5 !important;">OUR</span> '
-            '<span style="color:#B7F34A !important;">ACTIVITIES</span>'
-            '</h1>'
-            '<div class="general-page-divider"></div>'
-            '<p class="general-page-subtitle">'
-            'Explore group fitness sessions designed to keep you active, '
-            'energised and consistent.'
-            '</p>'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-
-        # -------------------------------------------------
-        # BACK LINK
-        # -------------------------------------------------
-
-        if st.button(
-            "← Back",
-            key="back_from_activities"
-        ):
-            st.session_state["selected_category"] = None
-            st.session_state["selected_activity"] = None
-            st.rerun()
-
-
-        # -------------------------------------------------
-        # ACTIVITY SELECTOR
-        # -------------------------------------------------
-
-        st.markdown(
-            '<p class="activity-select-label">CHOOSE AN ACTIVITY</p>',
-            unsafe_allow_html=True
-        )
-
-        activity = st.session_state.get(
-            "selected_activity"
-        )
-
-        activity_left, activity_center, activity_right = st.columns(
-            [0.7, 4, 0.7]
-        )
-
-        with activity_center:
-
-            col1, col2, col3 = st.columns(
-                3,
-                gap="medium"
-            )
-
-
-            # YOGA
-            with col1:
-
-                if st.button(
-                    "YOGA",
-                    use_container_width=True,
-                    key="activity_yoga",
-                    type=(
-                        "primary"
-                        if activity == "Yoga"
-                        else "secondary"
-                    )
-                ):
-                    st.session_state["selected_activity"] = "Yoga"
-                    st.rerun()
-
-
-            # ZUMBA
-            with col2:
-
-                if st.button(
-                    "ZUMBA",
-                    use_container_width=True,
-                    key="activity_zumba",
-                    type=(
-                        "primary"
-                        if activity == "Zumba"
-                        else "secondary"
-                    )
-                ):
-                    st.session_state["selected_activity"] = "Zumba"
-                    st.rerun()
-
-
-            # AEROBICS
-            with col3:
-
-                if st.button(
-                    "AEROBICS",
-                    use_container_width=True,
-                    key="activity_aerobics",
-                    type=(
-                        "primary"
-                        if activity == "Aerobics"
-                        else "secondary"
-                    )
-                ):
-                    st.session_state["selected_activity"] = "Aerobics"
-                    st.rerun()
-
-
-        # -------------------------------------------------
-        # ACTIVITY INFORMATION
-        # -------------------------------------------------
-
-        activity = st.session_state.get(
-            "selected_activity"
-        )
-
-
-        if activity == "Yoga":
-
-            st.markdown(
-                """
-
-
-**Days**  
-Monday, Wednesday and Friday
-
-**Timing**  
-7:00 AM – 8:00 AM
-                """
-            )
-
-
-        elif activity == "Zumba":
-
-            st.markdown(
-                """
-
-
-**Days**  
-Tuesday and Thursday
-
-**Timing**  
-7:00 PM – 8:00 PM
-                """
-            )
-
-
-        elif activity == "Aerobics":
-
-            st.markdown(
-                """
-
-
-**Day**  
-Saturday
-
-**Timing**  
-8:00 AM – 9:00 AM
-                """
-            )
-
-
-       # =====================================================
-    # TRAINERS
-    # =====================================================
-
-    elif st.session_state["selected_category"] == "trainers":
-
-        # -------------------------------------------------
-        # PAGE HEADER
-        # -------------------------------------------------
-
-        st.markdown(
-            '<div class="general-page-header">'
-            '<h1 class="general-page-title">'
-            '<span style="color:#F5F5F5 !important;">MEET OUR</span> '
-            '<span style="color:#B7F34A !important;">TRAINERS</span>'
-            '</h1>'
-            '<div class="general-page-divider"></div>'
-            '<p class="general-page-subtitle">'
-            'Meet our fitness professionals and find the right trainer '
-            'to support your goals.'
-            '</p>'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-
-        # -------------------------------------------------
-        # BACK LINK
-        # -------------------------------------------------
-
-        if st.button(
-            "← Back",
-            key="back_from_trainers"
-        ):
-            st.session_state["selected_category"] = None
-            st.rerun()
-
-
-        # -------------------------------------------------
-        # TRAINER CARDS
-        # -------------------------------------------------
-
-        col1, col2, col3 = st.columns(
-            3,
-            gap="large"
-        )
-
-
-        # -------------------------------------------------
-        # RAHUL
-        # -------------------------------------------------
-
-        with col1:
-
-            st.image(
-                "images/rahul.png",
-                width=150
-            )
-
-            st.markdown(
-                "### Rahul Sharma"
-            )
-
-            st.write(
-                "Personal Trainer"
-            )
-
-            st.markdown(
-                """
-**Specialization**  
-Strength Training & Muscle Building
-
-**Experience**  
-6 years
-
-**Availability**  
-Mon–Sat, 6:00 AM – 12:00 PM
-
-**Contact**  
-+91-90000-00001
-                """
-            )
-
-
-        # -------------------------------------------------
-        # PRIYA
-        # -------------------------------------------------
-
-        with col2:
-
-            st.image(
-                "images/priya.png",
-                width=150
-            )
-
-            st.markdown(
-                "### Priya Mehta"
-            )
-
-            st.write(
-                "Personal Trainer"
-            )
-
-            st.markdown(
-                """
-**Specialization**  
-Functional Training & General Fitness
-
-**Experience**  
-4 years
-
-**Availability**  
-Mon–Sat, 4:00 PM – 9:00 PM
-
-**Contact**  
-+91-90000-00002
-                """
-            )
-
-
-        # -------------------------------------------------
-        # ARJUN
-        # -------------------------------------------------
-
-        with col3:
-
-            st.image(
-                "images/arjun.png",
-                width=150
-            )
-
-            st.markdown(
-                "### Arjun Patel"
-            )
-
-            st.write(
-                "Fitness Trainer"
-            )
-
-            st.markdown(
-                """
-**Specialization**  
-Weight Management & Cardio Training
-
-**Experience**  
-5 years
-
-**Availability**  
-Mon–Sat, 8:00 AM – 2:00 PM
-
-**Contact**  
-+91-90000-00003
-                """
-            )
-
-
-        # =====================================================
-    # GYM INFORMATION
-    # =====================================================
-
-    elif st.session_state["selected_category"] == "gym_info":
-
-        # -------------------------------------------------
-        # PAGE HEADER
-        # -------------------------------------------------
-
-        st.markdown(
-            '<div class="general-page-header">'
-            '<h1 class="general-page-title">'
-            '<span style="color:#F5F5F5 !important;">GYM</span> '
-            '<span style="color:#B7F34A !important;">INFORMATION</span>'
-            '</h1>'
-            '<div class="general-page-divider"></div>'
-            '<p class="general-page-subtitle">'
-            'Everything you need to know about FitZone facilities, '
-            'services and opening hours.'
-            '</p>'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-
-        # -------------------------------------------------
-        # BACK LINK
-        # -------------------------------------------------
-
-        if st.button(
-            "← Back",
-            key="back_from_gym_info"
-        ):
-            st.session_state["selected_category"] = None
-            st.rerun()
-
-
-        # -------------------------------------------------
-        # GYM INFORMATION CONTENT
-        # -------------------------------------------------
-
-        info_left, info_center, info_right = st.columns(
-            [0.4, 5, 0.4]
-        )
-
-        with info_center:
-
-            col1, col2 = st.columns(
-                2,
-                gap="large"
-            )
-
-
-            # ---------------------------------------------
-            # LEFT COLUMN
-            # ---------------------------------------------
-
-            with col1:
-
-                st.markdown(
-                    """
-### Timings
-
-**Monday – Saturday**  
-6:00 AM – 11:00 PM
-
-**Sunday**  
-Closed
-
-**Public Holidays**  
-Timings may vary.
-                    """
-                )
-
-
-                st.markdown(
-                    """
-### Facilities
-
-- Strength training area
-- Cardio section
-- Functional training area
-- Personal training
-- Changing rooms
-- Lockers
-                    """
-                )
-
-
-            # ---------------------------------------------
-            # RIGHT COLUMN
-            # ---------------------------------------------
-
-            with col2:
-
-                st.markdown(
-                    """
-### Member Services
-
-- Personal training
-- Group fitness activities
-- Functional training area
-- Changing rooms
-- Lockers
-                    """
-                )
-
-
-                st.markdown(
-                    """
-### About
-
-FitZone Fitness Club is a modern fitness center offering
-strength training, cardio, group fitness activities and
-personal training.
-                    """
-                )
+            with st.spinner("Creating your workout plan..."):
+                workout_text = call_gemini(
+                    st.session_
