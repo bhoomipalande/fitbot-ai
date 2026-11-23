@@ -4,8 +4,10 @@ import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from supabase import create_client, Client
 
 from gym_data import GYM_DATA
+from rag_engine import DEFAULT_KNOWLEDGE_DOCS, embed_texts, retrieve_relevant_context
 from styles import load_css
 from ui import show_header, show_categories
 
@@ -15,7 +17,7 @@ from ui import show_header, show_categories
 # =========================================================
 
 st.set_page_config(
-    page_title="FitBot AI",
+    page_title="FitBot AI — Agentic Gym SaaS",
     page_icon="🏋️",
     layout="centered"
 )
@@ -30,28 +32,44 @@ else:
 
 
 # =========================================================
-# GEMINI SETUP (WORKS LOCALLY & ON STREAMLIT CLOUD)
+# SECRETS & CLIENTS (LOCAL .ENV + STREAMLIT CLOUD)
 # =========================================================
 
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        api_key = None
+
+def get_secret(key_name: str):
+    val = os.getenv(key_name)
+    if not val:
+        try:
+            val = st.secrets[key_name]
+        except Exception:
+            val = None
+    return val
+
+
+api_key = get_secret("GEMINI_API_KEY")
+supabase_url = get_secret("SUPABASE_URL")
+supabase_key = get_secret("SUPABASE_KEY")
 
 client = genai.Client(api_key=api_key)
 
+supabase: Client | None = None
+if supabase_url and supabase_key:
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+    except Exception:
+        supabase = None
+
 MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
     "gemini-3.8-flash",
-    "gemini-2.5-flash-lite",
 ]
 
 
 # =========================================================
-# SESSION STATE
+# SESSION STATE & VECTOR INDEX INITIALIZATION
 # =========================================================
 
 if "selected_category" not in st.session_state:
@@ -69,13 +87,113 @@ if "messages" not in st.session_state:
 if "chat_open" not in st.session_state:
     st.session_state["chat_open"] = False
 
+if "active_gym" not in st.session_state:
+    st.session_state["active_gym"] = {
+        "name": "FitZone Fitness Club",
+        "city": "Pune",
+        "timings": "Mon-Sat: 6:00 AM - 11:00 PM",
+        "monthly_fee": "₹1,499/month",
+    }
+
+if "rag_docs" not in st.session_state:
+    st.session_state["rag_docs"] = list(DEFAULT_KNOWLEDGE_DOCS)
+
+if "rag_embeddings" not in st.session_state:
+    if api_key:
+        texts = [f"{d['title']}: {d['content']}" for d in st.session_state["rag_docs"]]
+        st.session_state["rag_embeddings"] = embed_texts(client, texts)
+    else:
+        st.session_state["rag_embeddings"] = []
+
 
 # =========================================================
-# TOOLS
+# SIDEBAR — MULTI-GYM SWITCHER + RAG KNOWLEDGE UPLOADER
+# =========================================================
+
+with st.sidebar:
+    st.markdown("### 🏢 Gym Tenant Switcher")
+    st.caption("White-label FitBot AI for any fitness club.")
+
+    gyms_list = [st.session_state["active_gym"]]
+    if supabase:
+        try:
+            res = supabase.table("gyms").select("*").order("created_at").execute()
+            if res.data:
+                gyms_list = res.data
+        except Exception:
+            pass
+
+    gym_names = [g["name"] for g in gyms_list]
+    current_name = st.session_state["active_gym"]["name"]
+    default_idx = gym_names.index(current_name) if current_name in gym_names else 0
+
+    chosen_gym_name = st.selectbox("Active Gym", gym_names, index=default_idx)
+    for g in gyms_list:
+        if g["name"] == chosen_gym_name:
+            st.session_state["active_gym"] = g
+            break
+
+    active_gym = st.session_state["active_gym"]
+    st.info(
+        f"**{active_gym['name']}** ({active_gym['city']})\n\n"
+        f"🕒 {active_gym['timings']}\n\n"
+        f"💳 {active_gym['monthly_fee']}"
+    )
+
+    with st.expander("➕ Register a New Gym"):
+        new_gym_name = st.text_input("Gym Name", placeholder="e.g., Gold's Gym Koregaon Park")
+        new_gym_city = st.text_input("City", placeholder="e.g., Pune")
+        new_gym_timings = st.text_input("Timings", value="Mon-Sat: 6:00 AM - 10:00 PM")
+        new_gym_fee = st.text_input("Monthly Fee", value="₹1,999/month")
+
+        if st.button("ONBOARD GYM", use_container_width=True):
+            if new_gym_name.strip() and new_gym_city.strip():
+                new_record = {
+                    "name": new_gym_name.strip(),
+                    "city": new_gym_city.strip(),
+                    "timings": new_gym_timings.strip(),
+                    "monthly_fee": new_gym_fee.strip(),
+                }
+                if supabase:
+                    try:
+                        supabase.table("gyms").insert(new_record).execute()
+                        st.session_state["active_gym"] = new_record
+                        st.success(f"{new_gym_name} registered to Supabase!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"DB Error: {e}")
+                else:
+                    st.warning("Connect Supabase keys first to persist new gyms.")
+
+    st.divider()
+    st.markdown("### 📚 RAG Knowledge Base")
+    st.caption(f"Indexed policy chunks: **{len(st.session_state['rag_docs'])}**")
+
+    uploaded_doc = st.file_uploader("Upload Custom Gym Policy (.txt / .md)", type=["txt", "md"])
+    if uploaded_doc is not None:
+        doc_text = uploaded_doc.read().decode("utf-8").strip()
+        if doc_text and not any(d["title"] == uploaded_doc.name for d in st.session_state["rag_docs"]):
+            new_doc = {"title": uploaded_doc.name, "content": doc_text}
+            st.session_state["rag_docs"].append(new_doc)
+            if api_key:
+                new_emb = embed_texts(client, [f"{new_doc['title']}: {new_doc['content']}"])[0]
+                st.session_state["rag_embeddings"].append(new_emb)
+            st.success(f"Indexed '{uploaded_doc.name}' into Vector Store!")
+
+    st.divider()
+    if supabase:
+        st.success("🟢 Supabase PostgreSQL Connected")
+    else:
+        st.warning("🟡 Supabase Not Configured (Local Mode)")
+
+
+# =========================================================
+# AGENTIC TOOLS (MACRO CALCULATOR + SUPABASE BOOKING + RAG)
 # =========================================================
 
 def calculate_macros(weight_kg: float, goal: str) -> str:
     """Calculates daily calories and macronutrients based on weight in kg and fitness goal (e.g., 'weight loss', 'muscle gain')."""
+    st.session_state["last_tool_used"] = f"calculate_macros(weight_kg={weight_kg}, goal='{goal}')"
     if "loss" in goal.lower():
         calories = weight_kg * 22
         protein = weight_kg * 2.0
@@ -86,9 +204,35 @@ def calculate_macros(weight_kg: float, goal: str) -> str:
     return f"Target Calories: {calories:.0f} kcal, Protein target: {protein:.0f}g."
 
 
-def book_trainer_session(trainer_name: str, time_slot: str) -> str:
-    """Books a personal training session with a specific trainer at a specific time."""
-    return f"Success! Mock session booked with {trainer_name} at {time_slot}."
+def book_trainer_session(
+    trainer_name: str,
+    time_slot: str,
+    member_name: str = "Guest Member",
+    member_phone: str = "Not Provided"
+) -> str:
+    """Books a personal training session with a specific trainer at a specific time and saves it to the gym's Supabase database."""
+    st.session_state["last_tool_used"] = (
+        f"book_trainer_session(trainer='{trainer_name}', slot='{time_slot}', member='{member_name}')"
+    )
+    gym_name = st.session_state["active_gym"]["name"]
+
+    if supabase:
+        try:
+            supabase.table("bookings").insert({
+                "gym_name": gym_name,
+                "member_name": member_name,
+                "member_phone": member_phone,
+                "trainer_name": trainer_name,
+                "time_slot": time_slot,
+            }).execute()
+            return (
+                f"Confirmed! Saved to {gym_name}'s PostgreSQL database: "
+                f"Session with {trainer_name} at {time_slot} for {member_name}."
+            )
+        except Exception as e:
+            return f"Database error while booking: {str(e)}"
+
+    return f"Session booked (local mode) with {trainer_name} at {time_slot} for {member_name}."
 
 
 # =========================================================
@@ -106,9 +250,6 @@ def call_gemini(prompt: str, use_tools: bool = False) -> str:
 
         if use_tools:
             config_kwargs["tools"] = [calculate_macros, book_trainer_session]
-
-        if "3.8" in model_name or "2.5" in model_name:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
 
         for attempt in range(2):
             try:
@@ -132,36 +273,71 @@ def call_gemini(prompt: str, use_tools: bool = False) -> str:
 
 
 # =========================================================
-# HELPER — GENERATE FITBOT RESPONSE
+# AGENTIC WORKFLOW — RAG RETRIEVAL + TOOL ROUTING
 # =========================================================
 
-def generate_fitbot_response():
+def generate_fitbot_response() -> tuple[str, dict]:
+    active_gym = st.session_state["active_gym"]
+    st.session_state["last_tool_used"] = None
 
+    latest_user_query = ""
     conversation_history = ""
 
     for message in st.session_state["messages"]:
         role = "USER" if message["role"] == "user" else "FITBOT"
         conversation_history += f"{role}: {message['content']}\n\n"
+        if message["role"] == "user":
+            latest_user_query = message["content"]
 
+    # Step 1: RAG Vector Retrieval over Gym Policies & Knowledge Base
+    retrieved_chunks = []
+    if api_key and st.session_state["rag_embeddings"]:
+        retrieved_chunks = retrieve_relevant_context(
+            client=client,
+            query=latest_user_query,
+            docs=st.session_state["rag_docs"],
+            doc_embeddings=st.session_state["rag_embeddings"],
+            top_k=3,
+        )
+
+    rag_context_str = "\n".join(
+        [f"- [{c['title']} | Similarity: {c['score']}]: {c['content']}" for c in retrieved_chunks]
+    )
+
+    # Step 2: Augmented Prompt with Retrieved Context + Active Tenant + Tools
     prompt = f"""
-You are FitBot AI, the virtual gym receptionist and fitness assistant
-for FitZone Fitness Club.
+You are FitBot AI, an autonomous agentic gym receptionist and fitness assistant for {active_gym['name']} in {active_gym['city']}.
 
-GYM INFORMATION:
+ACTIVE GYM PROFILE:
+- Gym Name: {active_gym['name']}
+- City: {active_gym['city']}
+- Timings: {active_gym['timings']}
+- Base Monthly Membership: {active_gym['monthly_fee']}
+
+RETRIEVED KNOWLEDGE BASE CONTEXT (RAG):
+{rag_context_str}
+
+TRAINERS & GROUP ACTIVITIES:
 {GYM_DATA}
 
-CONVERSATION:
+CONVERSATION HISTORY:
 {conversation_history}
 
-INSTRUCTIONS:
-- Continue the conversation naturally and remember earlier messages.
-- For FitZone-specific information, use ONLY the provided GYM INFORMATION.
-- If the user asks for calorie or macro targets based on their weight, use the calculate_macros tool.
-- If the user asks to book a trainer, use the book_trainer_session tool.
-- Keep responses friendly, professional, and concise.
+AGENT INSTRUCTIONS:
+1. Ground policy, freeze, refund, guest pass, pricing tier, and etiquette answers strictly in the RETRIEVED KNOWLEDGE BASE CONTEXT above.
+2. If the user asks for daily calories or protein/macros based on their weight, invoke the `calculate_macros` tool.
+3. If the user asks to book a personal trainer session, invoke the `book_trainer_session` tool immediately (use 'Guest Member' if they didn't mention a name).
+4. Keep responses helpful, structured, and concise.
 """
 
-    return call_gemini(prompt, use_tools=True)
+    reply = call_gemini(prompt, use_tools=True)
+
+    trace = {
+        "rag_sources": retrieved_chunks,
+        "tool_called": st.session_state.get("last_tool_used"),
+        "gym": active_gym["name"],
+    }
+    return reply, trace
 
 
 # =========================================================
@@ -173,61 +349,73 @@ if st.session_state["chat_open"]:
     back_col, space_col, end_col = st.columns([1.5, 3, 1.7])
 
     with back_col:
-        if st.button(
-            "← BACK TO HOME",
-            key="back_from_chat",
-            use_container_width=True
-        ):
+        if st.button("← BACK TO HOME", key="back_from_chat", use_container_width=True):
             st.session_state["chat_open"] = False
             st.rerun()
 
     with end_col:
-        if st.button(
-            "END CONVERSATION",
-            key="end_conversation",
-            use_container_width=True
-        ):
+        if st.button("END CONVERSATION", key="end_conversation", use_container_width=True):
             st.session_state["messages"] = []
             st.session_state["chat_open"] = False
             st.session_state["selected_category"] = None
             st.rerun()
 
     st.markdown(
-        '<div class="chat-page-header">'
-        '<div class="chat-page-title">'
-        '<span style="color:#F5F5F5 !important;">FITBOT</span> '
-        '<span style="color:#B7F34A !important;">AI</span>'
-        '</div>'
-        '<div class="chat-page-divider"></div>'
-        '<div class="chat-page-subtitle">'
-        'YOUR PERSONAL FITNESS ASSISTANT'
-        '</div>'
-        '</div>',
+        f'<div class="chat-page-header">'
+        f'<div class="chat-page-title">'
+        f'<span style="color:#F5F5F5 !important;">FITBOT</span> '
+        f'<span style="color:#B7F34A !important;">AI</span>'
+        f'</div>'
+        f'<div class="chat-page-divider"></div>'
+        f'<div class="chat-page-subtitle">'
+        f'CONCIERGE FOR {st.session_state["active_gym"]["name"].upper()}'
+        f'</div>'
+        f'</div>',
         unsafe_allow_html=True
     )
 
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message.get("trace"):
+                with st.expander("🔍 Agent Workflow Trace (RAG + Tool Calling)"):
+                    trace = message["trace"]
+                    if trace.get("tool_called"):
+                        st.success(f"🛠️ Tool Executed: `{trace['tool_called']}`")
+                    else:
+                        st.info("🛠️ Tool Executed: None (Answered via RAG + LLM)")
 
-    user_message = st.chat_input("Ask a follow-up question...")
+                    st.markdown("**📚 Top Retrieved RAG Chunks:**")
+                    for src in trace.get("rag_sources", []):
+                        st.markdown(f"- **{src['title']}** (Similarity: `{src['score']}`): {src['content']}")
+
+    # Generate response if the last message is from the user (e.g., just arrived from home screen)
+    if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+        with st.chat_message("assistant"):
+            with st.spinner("Retrieving RAG context & running FitBot Agent..."):
+                assistant_reply, trace = generate_fitbot_response()
+            st.markdown(assistant_reply)
+            with st.expander("🔍 Agent Workflow Trace (RAG + Tool Calling)"):
+                if trace.get("tool_called"):
+                    st.success(f"🛠️ Tool Executed: `{trace['tool_called']}`")
+                else:
+                    st.info("🛠️ Tool Executed: None (Answered via RAG + LLM)")
+
+                st.markdown("**📚 Top Retrieved RAG Chunks:**")
+                for src in trace.get("rag_sources", []):
+                    st.markdown(f"- **{src['title']}** (Similarity: `{src['score']}`): {src['content']}")
+
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": assistant_reply,
+            "trace": trace,
+        })
+
+    user_message = st.chat_input("Ask about freeze policy, calculate macros, or book a trainer...")
 
     if user_message:
-        st.session_state["messages"].append(
-            {"role": "user", "content": user_message}
-        )
-
-        with st.chat_message("user"):
-            st.markdown(user_message)
-
-        with st.chat_message("assistant"):
-            with st.spinner("FitBot is thinking..."):
-                assistant_reply = generate_fitbot_response()
-            st.markdown(assistant_reply)
-
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": assistant_reply}
-        )
+        st.session_state["messages"].append({"role": "user", "content": user_message})
+        st.rerun()
 
 
 # =========================================================
@@ -242,6 +430,10 @@ else:
 
     if st.session_state["selected_category"] is None:
         show_header()
+        st.caption(
+            f"Currently serving: **{st.session_state['active_gym']['name']}** "
+            f"({st.session_state['active_gym']['city']})"
+        )
         workout, activities, trainers, gym_info = show_categories()
 
         if workout:
@@ -260,20 +452,16 @@ else:
             st.session_state["selected_category"] = "gym_info"
             st.rerun()
 
-        # New Feature Button
-        calc_left, calc_center, calc_right = st.columns([1, 2, 1])
-        with calc_center:
-            if st.button(
-                "📊 BMI & MACRO CALCULATOR",
-                key="open_calculator",
-                use_container_width=True
-            ):
+        b_space1, b_col1, b_col2, b_space2 = st.columns([0.6, 2, 2, 0.6], gap="medium")
+        with b_col1:
+            if st.button("📊 BMI & MACROS", key="open_calculator", use_container_width=True):
                 st.session_state["selected_category"] = "calculator"
                 st.rerun()
 
-        # =================================================
-        # ASK FITBOT — HOME
-        # =================================================
+        with b_col2:
+            if st.button("📋 LIVE BOOKINGS (DB)", key="open_bookings", use_container_width=True):
+                st.session_state["selected_category"] = "bookings"
+                st.rerun()
 
         st.divider()
 
@@ -289,24 +477,67 @@ else:
         with st.form("home_chat_form", clear_on_submit=True):
             first_message = st.text_input(
                 "Ask FitBot",
-                placeholder="Ask about workouts, trainers, activities, gym timings, or fitness...",
+                placeholder="Ask about freeze policy, calculate macros, or book a trainer...",
                 label_visibility="collapsed"
             )
 
-            send_message = st.form_submit_button(
-                "START CHAT →",
-                use_container_width=True
-            )
+            send_message = st.form_submit_button("START CHAT →", use_container_width=True)
 
         if send_message and first_message.strip():
-            st.session_state["messages"] = [
-                {"role": "user", "content": first_message.strip()}
-            ]
+            st.session_state["messages"] = [{"role": "user", "content": first_message.strip()}]
             st.session_state["chat_open"] = True
             st.rerun()
 
     # =====================================================
-    # BMI & MACRO CALCULATOR (NEW FEATURE)
+    # LIVE BOOKINGS (SUPABASE DB VIEW)
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "bookings":
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">LIVE</span> '
+            '<span style="color:#B7F34A !important;">BOOKINGS</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Real-time personal training bookings stored in Supabase PostgreSQL.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_bookings"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        if not supabase:
+            st.warning("Supabase is not connected yet. Add SUPABASE_URL and SUPABASE_KEY to view live database records.")
+        else:
+            try:
+                active_name = st.session_state["active_gym"]["name"]
+                res = (
+                    supabase.table("bookings")
+                    .select("*")
+                    .eq("gym_name", active_name)
+                    .order("created_at", desc=True)
+                    .execute()
+                )
+                if res.data:
+                    st.dataframe(
+                        res.data,
+                        column_order=["member_name", "trainer_name", "time_slot", "gym_name", "created_at"],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info(f"No bookings yet for **{active_name}**. Ask FitBot in chat to book a trainer!")
+            except Exception as e:
+                st.error(f"Could not fetch bookings: {e}")
+
+    # =====================================================
+    # BMI & MACRO CALCULATOR
     # =====================================================
 
     elif st.session_state["selected_category"] == "calculator":
@@ -332,24 +563,9 @@ else:
         calc_l, calc_c, calc_r = st.columns([0.8, 3.5, 0.8])
 
         with calc_c:
-            weight = st.number_input(
-                "Weight (kg)",
-                min_value=30.0,
-                max_value=200.0,
-                value=70.0,
-                step=0.5
-            )
-            height_cm = st.number_input(
-                "Height (cm)",
-                min_value=120.0,
-                max_value=230.0,
-                value=170.0,
-                step=1.0
-            )
-            goal = st.selectbox(
-                "Fitness Goal",
-                ["Weight Loss", "Maintenance", "Muscle Gain"]
-            )
+            weight = st.number_input("Weight (kg)", min_value=30.0, max_value=200.0, value=70.0, step=0.5)
+            height_cm = st.number_input("Height (cm)", min_value=120.0, max_value=230.0, value=170.0, step=1.0)
+            goal = st.selectbox("Fitness Goal", ["Weight Loss", "Maintenance", "Muscle Gain"])
 
             if st.button("CALCULATE →", key="run_calc", use_container_width=True):
                 height_m = height_cm / 100
@@ -414,18 +630,168 @@ else:
                 key="workout_level"
             )
 
-            if st.button(
-                "GET WORKOUT PLAN →",
-                key="get_workout_plan",
-                use_container_width=True
-            ):
+            if st.button("GET WORKOUT PLAN →", key="get_workout_plan", use_container_width=True):
                 st.session_state["workout_request"] = (
                     f"Create a {workout_level} level workout plan for me. "
-                    "Make it clear, structured, practical and suitable "
-                    "for a gym member."
+                    "Make it clear, structured, practical and suitable for a gym member."
                 )
 
         if st.session_state["workout_request"]:
             with st.spinner("Creating your workout plan..."):
-                workout_text = call_gemini(
-                    st.session_
+                workout_text = call_gemini(st.session_state["workout_request"], use_tools=False)
+
+            st.markdown(
+                '<div class="general-page-header" style="margin-top:40px;">'
+                '<h2 class="general-page-title" style="font-size:30px;">'
+                'YOUR <span>WORKOUT PLAN</span>'
+                '</h2>'
+                '<div class="general-page-divider"></div>'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            result_left, result_center, result_right = st.columns([0.7, 4, 0.7])
+
+            with result_center:
+                st.markdown('<div class="workout-result-label">FITBOT GENERATED PLAN</div>', unsafe_allow_html=True)
+                st.markdown(workout_text)
+
+            st.session_state["workout_request"] = None
+
+    # =====================================================
+    # ACTIVITIES
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "activities":
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">OUR</span> '
+            '<span style="color:#B7F34A !important;">ACTIVITIES</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Explore group fitness sessions designed to keep you active, energised and consistent.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_activities"):
+            st.session_state["selected_category"] = None
+            st.session_state["selected_activity"] = None
+            st.rerun()
+
+        st.markdown('<p class="activity-select-label">CHOOSE AN ACTIVITY</p>', unsafe_allow_html=True)
+        activity = st.session_state.get("selected_activity")
+        activity_left, activity_center, activity_right = st.columns([0.7, 4, 0.7])
+
+        with activity_center:
+            col1, col2, col3 = st.columns(3, gap="medium")
+
+            with col1:
+                if st.button("YOGA", use_container_width=True, key="activity_yoga", type="primary" if activity == "Yoga" else "secondary"):
+                    st.session_state["selected_activity"] = "Yoga"
+                    st.rerun()
+
+            with col2:
+                if st.button("ZUMBA", use_container_width=True, key="activity_zumba", type="primary" if activity == "Zumba" else "secondary"):
+                    st.session_state["selected_activity"] = "Zumba"
+                    st.rerun()
+
+            with col3:
+                if st.button("AEROBICS", use_container_width=True, key="activity_aerobics", type="primary" if activity == "Aerobics" else "secondary"):
+                    st.session_state["selected_activity"] = "Aerobics"
+                    st.rerun()
+
+        activity = st.session_state.get("selected_activity")
+
+        if activity == "Yoga":
+            st.markdown("**Days**  \nMonday, Wednesday and Friday\n\n**Timing**  \n7:00 AM – 8:00 AM")
+        elif activity == "Zumba":
+            st.markdown("**Days**  \nTuesday and Thursday\n\n**Timing**  \n7:00 PM – 8:00 PM")
+        elif activity == "Aerobics":
+            st.markdown("**Day**  \nSaturday\n\n**Timing**  \n8:00 AM – 9:00 AM")
+
+    # =====================================================
+    # TRAINERS
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "trainers":
+
+        st.markdown(
+            '<div class="general-page-header">'
+            '<h1 class="general-page-title">'
+            '<span style="color:#F5F5F5 !important;">MEET OUR</span> '
+            '<span style="color:#B7F34A !important;">TRAINERS</span>'
+            '</h1>'
+            '<div class="general-page-divider"></div>'
+            '<p class="general-page-subtitle">'
+            'Meet our fitness professionals and find the right trainer to support your goals.'
+            '</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_trainers"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        col1, col2, col3 = st.columns(3, gap="large")
+
+        with col1:
+            st.image("images/rahul.png", width=150)
+            st.markdown("### Rahul Sharma")
+            st.write("Personal Trainer")
+            st.markdown("**Specialization**  \nStrength Training & Muscle Building\n\n**Experience**  \n6 years\n\n**Availability**  \nMon–Sat, 6:00 AM – 12:00 PM\n\n**Contact**  \n+91-90000-00001")
+
+        with col2:
+            st.image("images/priya.png", width=150)
+            st.markdown("### Priya Mehta")
+            st.write("Personal Trainer")
+            st.markdown("**Specialization**  \nFunctional Training & General Fitness\n\n**Experience**  \n4 years\n\n**Availability**  \nMon–Sat, 4:00 PM – 9:00 PM\n\n**Contact**  \n+91-90000-00002")
+
+        with col3:
+            st.image("images/arjun.png", width=150)
+            st.markdown("### Arjun Patel")
+            st.write("Fitness Trainer")
+            st.markdown("**Specialization**  \nWeight Management & Cardio Training\n\n**Experience**  \n5 years\n\n**Availability**  \nMon–Sat, 8:00 AM – 2:00 PM\n\n**Contact**  \n+91-90000-00003")
+
+    # =====================================================
+    # GYM INFORMATION
+    # =====================================================
+
+    elif st.session_state["selected_category"] == "gym_info":
+        active_gym = st.session_state["active_gym"]
+
+        st.markdown(
+            f'<div class="general-page-header">'
+            f'<h1 class="general-page-title">'
+            f'<span style="color:#F5F5F5 !important;">{active_gym["name"].upper()}</span> '
+            f'<span style="color:#B7F34A !important;">INFO</span>'
+            f'</h1>'
+            f'<div class="general-page-divider"></div>'
+            f'<p class="general-page-subtitle">'
+            f'Facilities, membership pricing, and hours for {active_gym["name"]} ({active_gym["city"]}).'
+            f'</p>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        if st.button("← Back", key="back_from_gym_info"):
+            st.session_state["selected_category"] = None
+            st.rerun()
+
+        info_left, info_center, info_right = st.columns([0.4, 5, 0.4])
+
+        with info_center:
+            col1, col2 = st.columns(2, gap="large")
+
+            with col1:
+                st.markdown(f"### Timings\n\n**Schedule**  \n{active_gym['timings']}\n\n**Public Holidays**  \nTimings may vary.")
+                st.markdown("### Facilities\n\n- Strength training area\n- Cardio section\n- Functional training area\n- Personal training\n- Changing rooms & Lockers")
+
+            with col2:
+                st.markdown(f"### Membership\n\n**Standard Plan**  \n{active_gym['monthly_fee']}\n\n- Full gym floor access\n- Group fitness classes\n- AI workout & macro guidance")
+                st.markdown(f"### About\n\n{active_gym['name']} in {active_gym['city']} is powered by FitBot AI to streamline member onboarding, personal training bookings, and workout guidance.")
