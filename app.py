@@ -353,27 +353,27 @@ if st.session_state["auth_user"] is None:
         st.error(f"🔒 Too many failed attempts. Please wait **{wait_sec} seconds** before trying again.")
         st.stop()
 
-    login_tab, activate_tab = st.tabs(["🔑 Member & Owner Login", "🆕 First-Time ID Activation"])
+    login_tab, activate_tab = st.tabs(["🔑 Login", "🆕 ID Activation"])
 
     # -----------------------------------------------------
-    # TAB 1: RETURNING MEMBER / OWNER LOGIN
+    # TAB 1: LOGIN
     # -----------------------------------------------------
     with login_tab:
-        st.markdown("Enter your issued **Member ID** (or **Owner ID**) and password to access your branch.")
+        st.markdown("Enter your issued ID and password to access your branch.")
         with st.form("member_login_form"):
-            in_id = st.text_input("Member / Owner ID", placeholder="e.g., OWN-BHOOMI or FZ-PUN-1001")
+            in_id = st.text_input("Issued ID", placeholder="Enter your issued ID")
             in_pass = st.text_input("Password", type="password", placeholder="Enter your password")
-            submit_login = st.form_submit_button("ENTER CLUB PORTAL →", use_container_width=True)
+            submit_login = st.form_submit_button("LOGIN →", use_container_width=True)
 
         if submit_login:
             record = get_member_record(in_id)
             if not record:
                 st.session_state["failed_attempts"] += 1
-                st.error("❌ Invalid Member ID. Please check the ID issued by your gym.")
+                st.error("❌ Invalid ID. Please check the ID issued by your branch.")
             elif not record.get("is_activated"):
                 st.warning(
-                    "⚠️ This Member ID has not been activated yet. "
-                    "Switch to the **🆕 First-Time ID Activation** tab to verify your details and generate your password!"
+                    "⚠️ This ID has not been activated yet. "
+                    "Switch to the **🆕 ID Activation** tab to verify your details and generate your password."
                 )
             elif not verify_password(in_pass, record.get("password_hash")):
                 st.session_state["failed_attempts"] += 1
@@ -389,36 +389,26 @@ if st.session_state["auth_user"] is None:
                 st.session_state["current_session_id"] = None
                 st.rerun()
 
-        with st.expander("🧪 Presentation / Demo Credentials"):
-            st.markdown(
-                "- **Gym Owner (Mumbai + Pune Access):** ID `OWN-BHOOMI` | Password `OWNER123`\n"
-                "- **Unactivated Pune Member:** ID `FZ-PUN-1001` | Name `Rohan Kulkarni` | Email `rohan@gmail.com` | Last 4 digits `3210`\n"
-                "- **Unactivated Mumbai Member:** ID `FZ-MUM-2001` | Name `Ananya Deshmukh` | Email `ananya@gmail.com` | Last 4 digits `2345`"
-            )
-
     # -----------------------------------------------------
-    # TAB 2: ONE-TIME SELF-SERVICE ID ACTIVATION
+    # TAB 2: ID ACTIVATION
     # -----------------------------------------------------
     with activate_tab:
-        st.markdown(
-            "Received a Member ID from the front desk? Verify your enrollment details below "
-            "to generate your personal login password."
-        )
+        st.markdown("Verify your registered details to generate your personal login password.")
         with st.form("activate_id_form"):
-            act_id = st.text_input("Issued Member ID", placeholder="e.g., FZ-PUN-1001")
-            act_name = st.text_input("Full Name (as registered)", placeholder="e.g., Rohan Kulkarni")
-            act_email = st.text_input("Registered Email ID", placeholder="e.g., rohan@gmail.com")
-            act_phone4 = st.text_input("Last 4 Digits of Registered Phone", max_chars=4, placeholder="e.g., 3210")
-            submit_activate = st.form_submit_button("VERIFY & GENERATE PASSWORD →", use_container_width=True)
+            act_id = st.text_input("Issued Member ID", placeholder="Enter your issued ID")
+            act_name = st.text_input("Full Name (as registered)", placeholder="Enter your full name")
+            act_email = st.text_input("Email ID", placeholder="Enter your registered email")
+            act_phone4 = st.text_input("Last 4 Digits of Registered Phone Number", max_chars=4, placeholder="e.g., 3210")
+            submit_activate = st.form_submit_button("ACTIVATE & GENERATE PASSWORD →", use_container_width=True)
 
         if submit_activate:
             record = get_member_record(act_id)
             if not record:
-                st.error("❌ Member ID not found in our gym records.")
+                st.error("❌ ID not found in our records.")
             elif record.get("is_activated"):
                 st.error(
-                    "🔒 **Security Lock:** This Member ID has already been activated. "
-                    "Please log in using your generated password or contact the front desk for a reset."
+                    "🔒 This ID has already been activated. "
+                    "Please log in using your password or contact your branch desk for assistance."
                 )
             else:
                 name_ok = act_name.strip().lower() == record["full_name"].strip().lower()
@@ -434,36 +424,44 @@ if st.session_state["auth_user"] is None:
                             "is_activated": True,
                         }).eq("member_id", record["member_id"]).execute()
 
-                        st.success("✅ **Identity Verified! Your account is now active.**")
+                        st.success("✅ **Identity Verified! Save your credentials below:**")
                         st.info(
-                            f"**Save your login credentials now (shown once):**\n\n"
-                            f"- **Member ID:** `{record['member_id']}`\n"
+                            f"- **Issued ID:** `{record['member_id']}`\n"
                             f"- **Generated Password:** `{new_plain_pass}`\n"
-                            f"- **Assigned Branch:** {record['gym_name']} ({record['plan_type']})\n\n"
-                            f"Switch to the **🔑 Member & Owner Login** tab to enter!"
+                            f"- **Branch:** {record['gym_name']}\n\n"
+                            f"Switch to the **🔑 Login** tab to enter."
                         )
                     except Exception as e:
                         st.error(f"Database error during activation: {e}")
                 else:
                     st.session_state["failed_attempts"] += 1
-                    st.error("❌ Verification details do not match our enrollment records. Please double-check your Name, Email, and Phone digits.")
+                    st.error("❌ Verification details do not match our records. Please check and try again.")
 
     st.stop()
 
 
 # =========================================================
-# AUTHENTICATED PORTAL (ROLE-BASED ACCESS: OWNER VS MEMBER)
+# AUTHENTICATED PORTAL (OWNER, RECEPTION & MEMBER ROLES)
 # =========================================================
 
 current_user = st.session_state["auth_user"]
-is_owner = current_user.get("role") == "owner"
+user_role = current_user.get("role", "member")
+is_owner = user_role == "owner"
+is_reception = user_role == "reception"
+is_staff = is_owner or is_reception
 
 # =========================================================
 # SIDEBAR — ROLE-BASED BRANCH CONTROL & SAVED CHATS
 # =========================================================
 
 with st.sidebar:
-    role_badge = "👑 OWNER ADMIN" if is_owner else "🏋️ VERIFIED MEMBER"
+    if is_owner:
+        role_badge = "👑 OWNER ADMIN"
+    elif is_reception:
+        role_badge = "🛎️ RECEPTION DESK"
+    else:
+        role_badge = "🏋️ VERIFIED MEMBER"
+
     st.markdown(f"### {role_badge}")
     st.caption(f"**{current_user['full_name']}** • ID: `{current_user['member_id']}`")
 
@@ -477,7 +475,7 @@ with st.sidebar:
 
     st.divider()
 
-    # OWNER CAN SWITCH BETWEEN MUMBAI & PUNE; MEMBER IS LOCKED TO HOME BRANCH
+    # OWNER CAN SWITCH BETWEEN MUMBAI & PUNE; RECEPTION & MEMBERS ARE LOCKED TO THEIR BRANCH
     if is_owner:
         st.markdown("### 🏢 Multi-Branch Switcher")
         gyms_list = [st.session_state["active_gym"]]
@@ -499,7 +497,7 @@ with st.sidebar:
                 st.session_state["active_gym"] = g
                 break
     else:
-        st.markdown("### 🏢 Your Home Branch")
+        st.markdown("### 🏢 Assigned Branch")
         st.session_state["active_gym"] = fetch_gym_by_name(current_user["gym_name"])
 
     active_gym = st.session_state["active_gym"]
@@ -591,7 +589,6 @@ def book_trainer_session(
     member_name: str = "",
     member_phone: str = "On File"
 ) -> str:
-    # Automatically use logged-in member's verified name & ID
     verified_name = f"{current_user['full_name']} ({current_user['member_id']})"
     st.session_state["last_tool_used"] = (
         f"book_trainer_session(trainer='{trainer_name}', slot='{time_slot}', member='{verified_name}')"
@@ -860,13 +857,13 @@ else:
         show_header()
 
         active_gym = st.session_state["active_gym"]
-        member_filter = None if is_owner else current_user["member_id"]
+        member_filter = None if is_staff else current_user["member_id"]
         branch_bookings = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
         branch_reminders = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Active Branch", active_gym["city"], active_gym["name"])
-        m2.metric("PT Bookings", f"{len(branch_bookings)}", "Branch Total" if is_owner else "Your Sessions")
+        m2.metric("PT Bookings", f"{len(branch_bookings)}", "Branch Total" if is_staff else "Your Sessions")
         m3.metric("Reminders", f"{len(branch_reminders)}", "Scheduled")
 
         st.write("")
@@ -888,7 +885,7 @@ else:
             st.session_state["selected_category"] = "gym_info"
             st.rerun()
 
-        if is_owner:
+        if is_staff:
             b1, b2, b3, b4 = st.columns(4, gap="small")
             with b1:
                 if st.button("📊 MACROS", key="open_calculator", use_container_width=True):
@@ -955,10 +952,10 @@ else:
             st.rerun()
 
     # =====================================================
-    # OWNER ONLY: ISSUE MEMBER IDs & MANAGE ROSTER
+    # STAFF ONLY (OWNER & RECEPTION): ISSUE IDs & ROSTER
     # =====================================================
 
-    elif st.session_state["selected_category"] == "members_admin" and is_owner:
+    elif st.session_state["selected_category"] == "members_admin" and is_staff:
         active_gym = st.session_state["active_gym"]
 
         st.markdown(
@@ -969,7 +966,7 @@ else:
             '</h1>'
             '<div class="general-page-divider"></div>'
             f'<p class="general-page-subtitle">'
-            f'Issue new Member IDs for {active_gym["name"]}. Members activate their own password on first login.'
+            f'Issue new IDs for {active_gym["name"]}. Users activate their own password on first login.'
             f'</p>'
             '</div>',
             unsafe_allow_html=True
@@ -985,14 +982,23 @@ else:
         with st.form("issue_member_id_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
-                new_m_id = st.text_input("New Member ID", value=suggested_id)
-                new_m_name = st.text_input("Member Full Name", placeholder="e.g., Siddharth Joshi")
+                new_m_id = st.text_input("New Issued ID", value=suggested_id)
+                new_m_name = st.text_input("Full Name", placeholder="e.g., Siddharth Joshi")
             with c2:
-                new_m_email = st.text_input("Member Email ID", placeholder="e.g., siddharth@gmail.com")
+                new_m_email = st.text_input("Email ID", placeholder="e.g., siddharth@gmail.com")
                 new_m_phone4 = st.text_input("Last 4 Digits of Phone", max_chars=4, placeholder="e.g., 7890")
-            new_m_plan = st.selectbox("Membership Plan", ["Monthly", "Quarterly Pro", "Annual Elite"])
 
-            if st.form_submit_button("🪪 ISSUE MEMBER ID", use_container_width=True):
+            r_col1, r_col2 = st.columns(2)
+            with r_col1:
+                new_m_plan = st.selectbox(
+                    "Membership / Role Plan",
+                    ["Monthly", "Quarterly Pro", "Annual Elite", "Front Desk Staff"]
+                )
+            with r_col2:
+                role_options = ["member", "reception"] if is_owner else ["member"]
+                new_m_role = st.selectbox("Account Role", role_options)
+
+            if st.form_submit_button("🪪 ISSUE ID", use_container_width=True):
                 if new_m_id.strip() and new_m_name.strip() and new_m_email.strip() and len(new_m_phone4.strip()) == 4 and supabase:
                     try:
                         supabase.table("members").insert({
@@ -1002,16 +1008,15 @@ else:
                             "phone_last4": new_m_phone4.strip(),
                             "password_hash": None,
                             "is_activated": False,
-                            "role": "member",
+                            "role": new_m_role,
                             "gym_name": active_gym["name"],
                             "plan_type": new_m_plan,
                         }).execute()
                         st.success(
-                            f"✅ Issued ID **`{new_m_id.strip().upper()}`** to **{new_m_name.strip()}** ({active_gym['name']}). "
-                            f"They can now activate their password on the login screen!"
+                            f"✅ Issued ID **`{new_m_id.strip().upper()}`** ({new_m_role}) to **{new_m_name.strip()}** ({active_gym['name']})."
                         )
                     except Exception as e:
-                        st.error(f"Could not create member: {e}")
+                        st.error(f"Could not create record: {e}")
                 else:
                     st.warning("Please fill in all fields including 4 phone digits.")
 
@@ -1087,7 +1092,7 @@ else:
                 )
 
         st.subheader("Scheduled Workout Reminders")
-        member_filter = None if is_owner else current_user["member_id"]
+        member_filter = None if is_staff else current_user["member_id"]
         reminders_list = fetch_gym_reminders(active_gym["name"], member_filter=member_filter)
         if reminders_list:
             df_rem = pd.DataFrame(reminders_list)
@@ -1121,10 +1126,10 @@ else:
             st.session_state["selected_category"] = None
             st.rerun()
 
-        member_filter = None if is_owner else current_user["member_id"]
+        member_filter = None if is_staff else current_user["member_id"]
         bookings_data = fetch_gym_bookings(active_gym["name"], member_filter=member_filter)
 
-        if is_owner:
+        if is_staff:
             with st.expander("➕ Log Walk-In / Phone Booking", expanded=False):
                 with st.form("walkin_booking_form", clear_on_submit=True):
                     wb_col1, wb_col2 = st.columns(2)
@@ -1156,7 +1161,7 @@ else:
             display_cols = [c for c in ["member_name", "trainer_name", "time_slot", "created_at"] if c in df.columns]
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
-            if is_owner:
+            if is_staff:
                 csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "⬇️ EXPORT BRANCH SCHEDULE (CSV)",
