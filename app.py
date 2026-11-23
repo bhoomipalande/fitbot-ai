@@ -818,4 +818,4 @@ else:
 
             with col2:
                 st.markdown(f"### Membership\n\n**Standard Plan**  \n{active_gym['monthly_fee']}\n\n- Full gym floor access\n- Group fitness classes\n- AI workout & macro guidance")
-                st.markdown(f"### About\n\n{active_gym['name']} in {active_gym['city']} is powered by FitBot AI to streamline member onboarding, personal training bookings, and workout guidance.")git add .
+                st.markdown(f"### About\n\n{active_gym['name']} in {active_gym['city']} is powered by FitBot AI to streamline member onboarding, personal training bookings, and workout guidance.")
