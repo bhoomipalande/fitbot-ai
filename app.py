@@ -353,7 +353,7 @@ if st.session_state["auth_user"] is None:
         st.error(f"🔒 Too many failed attempts. Please wait **{wait_sec} seconds** before trying again.")
         st.stop()
 
-    login_tab, activate_tab = st.tabs(["🔑 Login", "🆕 ID Activation"])
+    login_tab, activate_tab = st.tabs([" Login", " ID Activation"])
 
     # -----------------------------------------------------
     # TAB 1: LOGIN
@@ -369,10 +369,10 @@ if st.session_state["auth_user"] is None:
             record = get_member_record(in_id)
             if not record:
                 st.session_state["failed_attempts"] += 1
-                st.error("❌ Invalid ID. Please check the ID issued by your branch.")
+                st.error(" Invalid ID. Please check the ID issued by your branch.")
             elif not record.get("is_activated"):
                 st.warning(
-                    "⚠️ This ID has not been activated yet. "
+                    " This ID has not been activated yet. "
                     "Switch to the **🆕 ID Activation** tab to verify your details and generate your password."
                 )
             elif not verify_password(in_pass, record.get("password_hash")):
@@ -380,7 +380,7 @@ if st.session_state["auth_user"] is None:
                 if st.session_state["failed_attempts"] >= 5:
                     st.session_state["lockout_until"] = time.time() + 60
                     st.session_state["failed_attempts"] = 0
-                st.error("❌ Incorrect password.")
+                st.error(" Incorrect password.")
             else:
                 st.session_state["failed_attempts"] = 0
                 st.session_state["auth_user"] = record
@@ -404,7 +404,7 @@ if st.session_state["auth_user"] is None:
         if submit_activate:
             record = get_member_record(act_id)
             if not record:
-                st.error("❌ ID not found in our records.")
+                st.error(" ID not found in our records.")
             elif record.get("is_activated"):
                 st.error(
                     "🔒 This ID has already been activated. "
@@ -429,13 +429,13 @@ if st.session_state["auth_user"] is None:
                             f"- **Issued ID:** `{record['member_id']}`\n"
                             f"- **Generated Password:** `{new_plain_pass}`\n"
                             f"- **Branch:** {record['gym_name']}\n\n"
-                            f"Switch to the **🔑 Login** tab to enter."
+                            f"Switch to the ** Login** tab to enter."
                         )
                     except Exception as e:
                         st.error(f"Database error during activation: {e}")
                 else:
                     st.session_state["failed_attempts"] += 1
-                    st.error("❌ Verification details do not match our records. Please check and try again.")
+                    st.error(" Verification details do not match our records. Please check and try again.")
 
     st.stop()
 
@@ -465,7 +465,7 @@ with st.sidebar:
     st.markdown(f"### {role_badge}")
     st.caption(f"**{current_user['full_name']}** • ID: `{current_user['member_id']}`")
 
-    if st.button("🚪 Log Out", use_container_width=True):
+    if st.button(" Log Out", use_container_width=True):
         st.session_state["auth_user"] = None
         st.session_state["messages"] = []
         st.session_state["current_session_id"] = None
@@ -553,7 +553,7 @@ with st.sidebar:
 
     if is_owner:
         st.divider()
-        st.markdown("### 📚 Branch RAG Policies")
+        st.markdown("### Branch RAG Policies")
         st.caption(f"Indexed docs: **{len(st.session_state['rag_docs'])}**")
         uploaded_doc = st.file_uploader("Upload Policy (.txt / .md)", type=["txt", "md"])
         if uploaded_doc is not None:
@@ -888,33 +888,33 @@ else:
         if is_staff:
             b1, b2, b3, b4 = st.columns(4, gap="small")
             with b1:
-                if st.button("📊 MACROS", key="open_calculator", use_container_width=True):
+                if st.button("MACROS", key="open_calculator", use_container_width=True):
                     st.session_state["selected_category"] = "calculator"
                     st.rerun()
             with b2:
-                if st.button("📋 BOOKINGS", key="open_bookings", use_container_width=True):
+                if st.button("BOOKINGS", key="open_bookings", use_container_width=True):
                     st.session_state["selected_category"] = "bookings"
                     st.rerun()
             with b3:
-                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                if st.button(" REMINDERS", key="open_reminders", use_container_width=True):
                     st.session_state["selected_category"] = "reminders"
                     st.rerun()
             with b4:
-                if st.button("🪪 MEMBERS", key="open_members", use_container_width=True):
+                if st.button(" MEMBERS", key="open_members", use_container_width=True):
                     st.session_state["selected_category"] = "members_admin"
                     st.rerun()
         else:
             b1, b2, b3 = st.columns(3, gap="small")
             with b1:
-                if st.button("📊 BMI & MACROS", key="open_calculator", use_container_width=True):
+                if st.button("BMI & MACROS", key="open_calculator", use_container_width=True):
                     st.session_state["selected_category"] = "calculator"
                     st.rerun()
             with b2:
-                if st.button("📋 MY BOOKINGS", key="open_bookings", use_container_width=True):
+                if st.button(" MY BOOKINGS", key="open_bookings", use_container_width=True):
                     st.session_state["selected_category"] = "bookings"
                     st.rerun()
             with b3:
-                if st.button("⏰ REMINDERS", key="open_reminders", use_container_width=True):
+                if st.button(" REMINDERS", key="open_reminders", use_container_width=True):
                     st.session_state["selected_category"] = "reminders"
                     st.rerun()
 
@@ -998,7 +998,7 @@ else:
                 role_options = ["member", "reception"] if is_owner else ["member"]
                 new_m_role = st.selectbox("Account Role", role_options)
 
-            if st.form_submit_button("🪪 ISSUE ID", use_container_width=True):
+            if st.form_submit_button(" ISSUE ID", use_container_width=True):
                 if new_m_id.strip() and new_m_name.strip() and new_m_email.strip() and len(new_m_phone4.strip()) == 4 and supabase:
                     try:
                         supabase.table("members").insert({
@@ -1013,7 +1013,7 @@ else:
                             "plan_type": new_m_plan,
                         }).execute()
                         st.success(
-                            f"✅ Issued ID **`{new_m_id.strip().upper()}`** ({new_m_role}) to **{new_m_name.strip()}** ({active_gym['name']})."
+                            f" Issued ID **`{new_m_id.strip().upper()}`** ({new_m_role}) to **{new_m_name.strip()}** ({active_gym['name']})."
                         )
                     except Exception as e:
                         st.error(f"Could not create record: {e}")
