@@ -1,6 +1,8 @@
 streamlit
 google-genai
-python-dotenv
+langgraph
 supabase
-numpy
+python-dotenv
 pandas
+numpy
+openpyxl
